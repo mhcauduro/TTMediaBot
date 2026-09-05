@@ -11,7 +11,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 
-REPO_URL="https://github.com/JoaoDEVWHADS/TTMediaBot.git"
+REPO_URL="https://github.com/mhcauduro/TTMediaBot.git"
 
 # Function to detect package manager and install packages
 install_packages() {
@@ -94,14 +94,14 @@ echo "--- Checking TeamTalk_DLL ---"
 
 # ... (down near line 148 and 154) ...
 
-DLL_URL="https://github.com/JoaoDEVWHADS/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
+DLL_URL="https://github.com/mhcauduro/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
 ARCH=$(uname -m)
 if [[ "$ARCH" == "aarch64" || "$ARCH" =~ ^arm ]]; then
     echo "ℹ️ ARM architecture detected ($ARCH). Using ARM DLL..."
-    DLL_URL="https://github.com/JoaoDEVWHADS/TTMediaBot/releases/download/downloadttdll/ttarm.zip"
+    DLL_URL="https://github.com/mhcauduro/TTMediaBot/releases/download/downloadttdll/ttarm.zip"
 else
     echo "ℹ️ x86_64/AMD64 architecture detected ($ARCH). Using x86 DLL..."
-    DLL_URL="https://github.com/JoaoDEVWHADS/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
+    DLL_URL="https://github.com/mhcauduro/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
 fi
 DLL_FILE="TeamTalk_DLL.zip"
 

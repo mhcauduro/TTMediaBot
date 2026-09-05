@@ -10,9 +10,9 @@ app_version = "4.0"
 client_name = app_name + "-V" + app_version
 about_text: Callable[[Translator], str] = lambda translator: translator.translate(
     """\
-Hello! I am João Almeida. This is my fork of TTMediaBot for TeamTalk 5.
+Hello! I am Matheus Cauduro. This is my fork of TTMediaBot for TeamTalk 5.
 This repository focuses on stability and support for YouTube Music.
-Repository: https://github.com/JoaoDEVWHADS/TTMediaBot
+Repository: https://github.com/mhcauduro/TTMediaBot
 Original Authors: Amir Gumerov, Vladislav Kopylov, Beqa Gozalishvili, Kirill Belousov.
 """
 )
