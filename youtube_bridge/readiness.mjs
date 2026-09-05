@@ -1,4 +1,5 @@
-// Some newly signed GVS URLs briefly return 403 before accepting media.
+// Probe the same open-ended request used by mpv/FFmpeg. A one-byte probe can
+// succeed even when YouTube rejects the rest of the media with HTTP 403.
 export async function waitForMedia(url, headers, {
   fetchImpl = fetch,
   now = () => performance.now(),
@@ -12,7 +13,7 @@ export async function waitForMedia(url, headers, {
     if (remaining <= 0) throw new Error('Audio stream readiness timed out');
     attempts++;
     const response = await fetchImpl(url, {
-      headers: { ...headers, Range: 'bytes=0-0' },
+      headers: { ...headers, Range: 'bytes=0-' },
       signal: AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(2000, remaining)))),
     });
     await response.body?.cancel();
@@ -22,7 +23,7 @@ export async function waitForMedia(url, headers, {
     if (response.status !== 403) {
       throw new Error('Audio stream returned HTTP ' + response.status);
     }
-    const delay = Math.min(500, timeoutMs - (now() - started));
+    const delay = Math.min(200, timeoutMs - (now() - started));
     if (delay <= 0) throw new Error('Audio stream still returned HTTP 403 after readiness timeout');
     await sleep(delay);
   }

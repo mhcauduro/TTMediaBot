@@ -9,7 +9,7 @@ function probe(statuses) {
       now: () => clock,
       sleep: async ms => { clock += ms; },
       fetchImpl: async (_, opts) => {
-        assert.equal(opts.headers.Range, 'bytes=0-0');
+        assert.equal(opts.headers.Range, 'bytes=0-');
         return { status: statuses[Math.min(calls++, statuses.length - 1)],
           body: { cancel: async () => { cancelled++; } } };
       },
@@ -24,13 +24,13 @@ test('returns immediately for ready media', async () => {
 });
 test('retries the same media until transient 403 clears', async () => {
   const p = probe([403,403,206]);
-  assert.deepEqual(await waitForMedia('https://example.test', {}, p.options), { attempts: 3, elapsedMs: 1000 });
+  assert.deepEqual(await waitForMedia('https://example.test', {}, p.options), { attempts: 3, elapsedMs: 400 });
   assert.deepEqual(p.counts(), { calls: 3, cancelled: 3 });
 });
 test('persistent 403 stops at the deadline', async () => {
   const p = probe([403]);
   await assert.rejects(waitForMedia('https://example.test', {}, {...p.options, timeoutMs: 1000}), /timed out|timeout/);
-  assert.equal(p.counts().calls, 2);
+  assert.equal(p.counts().calls, 5);
 });
 test('does not retry permanent failures', async () => {
   const p = probe([404]);

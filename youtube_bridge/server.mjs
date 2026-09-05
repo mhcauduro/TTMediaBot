@@ -36,7 +36,8 @@ async function loadDiskCache() {
     const raw = await fs.readFile(DISK_CACHE_FILE, 'utf8');
     const parsed = JSON.parse(raw);
     if (parsed.search) searchCache.load(parsed.search);
-    if (parsed.resolve) resolveCache.load(parsed.resolve);
+    // Older entries passed only a one-byte probe and may fail during playback.
+    if (parsed.resolve_probe_version === 2 && parsed.resolve) resolveCache.load(parsed.resolve);
     console.log(`[youtube-bridge] Loaded persistent disk cache (search: ${searchCache.size}, resolve: ${resolveCache.size})`);
   } catch (err) {
     if (err?.code !== 'ENOENT') {
@@ -52,6 +53,7 @@ function scheduleSaveDiskCache() {
     saveTimer = null;
     try {
       const data = {
+        resolve_probe_version: 2,
         search: searchCache.dump(),
         resolve: resolveCache.dump()
       };
@@ -213,12 +215,13 @@ async function getSearchSession() {
   return searchSessionPromise;
 }
 
-async function getPoToken(contentBinding) {
+async function getPoToken(contentBinding, bypassCache = false) {
   try {
     const response = await fetch(POT_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ content_binding: contentBinding })
+      body: JSON.stringify({ content_binding: contentBinding, bypass_cache: bypassCache }),
+      signal: AbortSignal.timeout(10000)
     });
     if (!response.ok) {
       const body = await response.text();
@@ -336,7 +339,7 @@ function playabilityDescription(info) {
   return reason ? `${status}: ${reason}` : status;
 }
 
-async function resolveFormat(context, videoId, requestedClient, formatOptions) {
+async function resolveFormat(context, videoId, requestedClient, formatOptions, preparedToken) {
   // WEB is SABR-only for many videos in 2026. MWEB still exposes classic
   // adaptive formats and is the preferred web playback client here.
   // Both services play through MWEB. Request aliases (WEB_EMBEDDED), rather
@@ -351,7 +354,7 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions) {
       const poStartedAt = performance.now();
       const poToken = client === 'WEB_EMBEDDED'
         ? undefined
-        : await getPoToken(videoId);
+        : await (preparedToken || getPoToken(videoId));
       console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=po-token elapsed_ms=${Math.round(performance.now() - poStartedAt)} available=${Boolean(poToken)}`);
 
       const playerStartedAt = performance.now();
@@ -368,16 +371,32 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions) {
         throw new Error('YouTube player is unavailable');
       }
 
-      session.session.player.po_token = poToken;
+      // Each concurrent resolution must decipher with its own video's token.
+      const player = Object.assign(Object.create(Object.getPrototypeOf(session.session.player)),
+        session.session.player, { po_token: poToken });
       const decipherStartedAt = performance.now();
-      format.url = await format.decipher(session.session.player);
+      format.url = await format.decipher(player);
       console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=decipher elapsed_ms=${Math.round(performance.now() - decipherStartedAt)}`);
 
       if (!format.url) {
         throw new Error('decipher returned an empty stream URL');
       }
 
-      const ready = await waitForMedia(format.url, { 'User-Agent': USER_AGENT });
+      let ready;
+      try {
+        ready = await waitForMedia(format.url, { 'User-Agent': USER_AGENT }, { timeoutMs: 6000 });
+      } catch (error) {
+        if (client !== 'MWEB' || !/403|timed out/.test(error.message)) throw error;
+        // Renew a rejected cached token once, instead of repeatedly handing the
+        // player a URL that only permits the first few bytes of the track.
+        const freshToken = await getPoToken(videoId, true);
+        if (!freshToken) throw error;
+        const renewed = new URL(format.url);
+        renewed.searchParams.set('pot', freshToken);
+        format.url = renewed.toString();
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=token-refresh`);
+        ready = await waitForMedia(format.url, { 'User-Agent': USER_AGENT });
+      }
       console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=media-ready elapsed_ms=${ready.elapsedMs} attempts=${ready.attempts}`);
       console.log(`[youtube-bridge] resolved ${videoId} with client=${client} itag=${format.itag} elapsed_ms=${Math.round(performance.now() - clientStartedAt)}`);
       return { info, format, client };
@@ -442,13 +461,15 @@ function invalidateResolution(body) {
 }
 
 async function resolveTrackUncached(body, videoId, requestedClient) {
+  // Token generation and cold session setup do not depend on each other.
+  const preparedToken = getPoToken(videoId);
   const context = await getSession(body.cookie_file);
 
   const { info, format, client } = await resolveFormat(context, videoId, requestedClient, {
     type: 'audio',
     quality: 'best',
     format: 'any'
-  });
+  }, preparedToken);
 
   const metadata = infoPayload(info, videoId);
   return {
