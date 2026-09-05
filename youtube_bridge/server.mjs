@@ -215,7 +215,16 @@ async function getSearchSession() {
   return searchSessionPromise;
 }
 
-async function getPoToken(contentBinding, bypassCache = false) {
+let tokenQueue = Promise.resolve();
+function getPoToken(contentBinding, bypassCache = false) {
+  // The shared provider initializes a process-wide BotGuard VM. Simultaneous
+  // cold requests can overwrite that state and mint rejected tokens.
+  const request = tokenQueue.then(() => requestPoToken(contentBinding, bypassCache));
+  tokenQueue = request.catch(() => {});
+  return request;
+}
+
+async function requestPoToken(contentBinding, bypassCache = false) {
   try {
     const response = await fetch(POT_URL, {
       method: 'POST',
