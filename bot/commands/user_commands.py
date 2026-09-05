@@ -839,6 +839,7 @@ class QueueAddCommand(Command):
 
         # Caso contrário, enfileira
         position = self.player.queue.add(track)
+        self.player._schedule_prefetch()
 
         if self.config.general.send_channel_messages:
             self.run_async(
