@@ -50,7 +50,7 @@ class YtService(_Service):
                 "YouTube may block requests requiring authentication."
             )
 
-        self._bridge = YouTubeBridge(self.config.cookiefile_path, client="YTMUSIC")
+        self._bridge = YouTubeBridge(self.config.cookiefile_path, client="WEB")
 
         # Run pre-warming in a background thread so the bot connects to TeamTalk immediately
         threading.Thread(target=self._pre_warm, daemon=True, name="YT_PreWarm").start()
@@ -65,8 +65,9 @@ class YtService(_Service):
             for attempt in range(1, 4):
                 try:
                     logging.info(f"YT Service pre-warming (attempt {attempt}/3)...")
-                    self.search("test", limit=1)
-                    self._bridge.resolve(video_id="48Lrud3Bxpc")
+                    # Warm discovery without resolving an unrelated video or
+                    # running search's autoplay side effects on the live queue.
+                    self._bridge.search("test", 1, mode="video")
                     self._is_warmed = True
                     logging.info("YT Service pre-warming finished successfully.")
                     return

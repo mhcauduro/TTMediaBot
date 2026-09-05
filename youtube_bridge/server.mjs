@@ -5,6 +5,7 @@ import path from 'node:path';
 import { URL } from 'node:url';
 import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
+import { waitForMedia } from './readiness.mjs';
 import { musicItemPayload, normalizeSearchKey, streamCacheTtlMs } from './media.mjs';
 
 const HOST = process.env.YOUTUBE_BRIDGE_HOST || '127.0.0.1';
@@ -145,9 +146,11 @@ async function getWebSessionData(cookie) {
     throw new Error(`YouTube session page returned HTTP ${response.status}`);
   }
   const page = await response.text();
+  const loggedIn = /"LOGGED_IN"\s*:\s*(true|false)/.exec(page);
   return {
     dataSyncId: pageConfigValue(page, 'DATASYNC_ID'),
-    visitorData: pageConfigValue(page, 'VISITOR_DATA')
+    visitorData: pageConfigValue(page, 'VISITOR_DATA'),
+    loggedIn: loggedIn ? loggedIn[1] === 'true' : undefined
   };
 }
 
@@ -167,6 +170,9 @@ async function getSession(cookieFile) {
   const contextPromise = (async () => {
     const cookie = await netscapeCookiesToHeader(cookieFile);
     const webSession = await getWebSessionData(cookie);
+    if (cookie && webSession.loggedIn === false) {
+      console.warn('[youtube-bridge] YouTube did not accept the cookie session; export fresh YouTube cookies.');
+    }
     const session = await Innertube.create({
       cookie: cookie || undefined,
       user_agent: USER_AGENT,
@@ -177,7 +183,7 @@ async function getSession(cookieFile) {
       generate_session_locally: true,
       retrieve_player: true
     });
-    return { session };
+    return { session, cookiesRejected: Boolean(cookie) && webSession.loggedIn === false };
   })().catch((error) => {
     sessionCache.delete(key);
     throw error;
@@ -333,9 +339,9 @@ function playabilityDescription(info) {
 async function resolveFormat(context, videoId, requestedClient, formatOptions) {
   // WEB is SABR-only for many videos in 2026. MWEB still exposes classic
   // adaptive formats and is the preferred web playback client here.
-  const clients = requestedClient === 'YTMUSIC'
-    ? ['YTMUSIC', 'MWEB', ClientType.TV_EMBEDDED]
-    : ['MWEB', ClientType.TV_EMBEDDED];
+  // Both services play through MWEB. Request aliases (WEB_EMBEDDED), rather
+  // than ClientType wire values, are required by getBasicInfo's client option.
+  const clients = ['MWEB', 'WEB_EMBEDDED'];
   const failures = [];
   const { session } = context;
 
@@ -343,7 +349,7 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions) {
     const clientStartedAt = performance.now();
     try {
       const poStartedAt = performance.now();
-      const poToken = client === ClientType.TV_EMBEDDED
+      const poToken = client === 'WEB_EMBEDDED'
         ? undefined
         : await getPoToken(videoId);
       console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=po-token elapsed_ms=${Math.round(performance.now() - poStartedAt)} available=${Boolean(poToken)}`);
@@ -371,6 +377,8 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions) {
         throw new Error('decipher returned an empty stream URL');
       }
 
+      const ready = await waitForMedia(format.url, { 'User-Agent': USER_AGENT });
+      console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=media-ready elapsed_ms=${ready.elapsedMs} attempts=${ready.attempts}`);
       console.log(`[youtube-bridge] resolved ${videoId} with client=${client} itag=${format.itag} elapsed_ms=${Math.round(performance.now() - clientStartedAt)}`);
       return { info, format, client };
     } catch (error) {
@@ -380,7 +388,10 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions) {
     }
   }
 
-  throw new Error(`Unable to resolve stream for ${videoId}; ${failures.join(' | ')}`);
+  const cookieHint = context.cookiesRejected
+    ? ' YouTube did not accept the cookie session; export fresh YouTube cookies.'
+    : '';
+  throw new Error(`Unable to resolve stream for ${videoId}; ${failures.join(' | ')}${cookieHint}`);
 }
 
 async function resolveTrack(body) {
