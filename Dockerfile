@@ -73,7 +73,8 @@ COPY . .
 RUN chmod +x entrypoint.sh
 
 # Adjust permissions (matching install.sh)
-RUN chown -R ttbot:ttbot /home/ttbot/TTMediaBot \
+RUN mkdir -p /home/ttbot/TTMediaBot/youtube_bridge/cache \
+    && chown -R ttbot:ttbot /home/ttbot/TTMediaBot \
     && chmod -R 775 .
 
 # Switch to user

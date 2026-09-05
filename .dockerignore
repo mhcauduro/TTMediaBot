@@ -23,3 +23,5 @@ temp/
 tmp/
 *.log
 *.bak
+youtube_bridge/cache/
+youtube_bridge/bridge_cache.json

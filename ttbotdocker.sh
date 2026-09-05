@@ -130,6 +130,8 @@ create_shared_youtube_service() {
         --restart always \
         -e "TTMEDIABOT_BOTS_ROOT=/bots" \
         -e "YOUTUBE_BRIDGE_HOST=0.0.0.0" \
+        -e "BRIDGE_CACHE_FILE=/home/ttbot/TTMediaBot/youtube_bridge/cache/bridge_cache.json" \
+        -v "ttmediabot-youtube-cache:/home/ttbot/TTMediaBot/youtube_bridge/cache" \
         -v "${BOTS_ROOT}:/bots:ro" \
         --entrypoint /bin/bash \
         "$BOT_IMAGE" \
