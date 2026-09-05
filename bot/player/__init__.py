@@ -291,66 +291,57 @@ class Player:
                 random.shuffle(missing)
                 self._index_list.extend(missing)
 
+    def _prefetch_candidates(self) -> List[Track]:
+        queued = self.queue.list_tracks()
+        if queued:
+            return queued[:3]
+        tracks = list(self.track_list)
+        if not tracks:
+            return []
+        if self.mode == Mode.Random:
+            self._sync_index_list()
+            try:
+                position = self._index_list.index(self.track_index)
+            except ValueError:
+                return []
+            # Do not predict a new shuffle before navigation chooses its order.
+            indices = self._index_list[position + 1:position + 4]
+        elif self.mode == Mode.RepeatTrack:
+            indices = [self.track_index]
+        else:
+            indices = list(range(self.track_index + 1, min(len(tracks), self.track_index + 4)))
+            if self.mode == Mode.RepeatTrackList:
+                indices += list(range(min(self.track_index, 3 - len(indices))))
+        return [tracks[i] for i in indices if 0 <= i < len(tracks)]
+
     def _prefetch_next_track(self) -> None:
         if not self._prefetch_lock.acquire(blocking=False):
             logging.info("[PlaybackTiming] next_track_prefetch_skipped reason=already_running")
             return
-        started_at = time.perf_counter()
+        attempted = set()
         try:
-            # Se há faixa na fila, ela será a próxima — prefetch dela
-            next_from_queue = self.queue.peek_next()
-            if next_from_queue is not None:
-                if not next_from_queue._is_fetched:
-                    logging.info(f"Prefetching next track from queue: {next_from_queue.name}")
-                    _ = next_from_queue.url
-                    elapsed_ms = (time.perf_counter() - started_at) * 1000
-                    logging.info(
-                        "[PlaybackTiming] next_track_prefetch_completed "
-                        f"elapsed_ms={elapsed_ms:.2f} source=queue "
-                        f"service={next_from_queue.service} "
-                        f"track={next_from_queue.name!r}"
-                    )
-                return
-
-            if not self.track_list:
-                return
-
-            next_index = -1
-            if self.mode == Mode.Random:
-                self._sync_index_list()
+            for _ in range(3):
+                if self.state == State.Stopped:
+                    break
+                # Recheck after each resolution: a queue entry or navigation
+                # during the request may have changed which track is next.
+                candidate = next((track for track in self._prefetch_candidates()
+                                  if id(track) not in attempted
+                                  and not track._is_fetched
+                                  and not getattr(track, "_fetch_failed", False)), None)
+                if candidate is None:
+                    break
+                attempted.add(id(candidate))
+                started_at = time.perf_counter()
                 try:
-                    current_pos = self._index_list.index(self.track_index)
-                    if current_pos + 1 < len(self._index_list):
-                        next_index = self._index_list[current_pos + 1]
-                    elif len(self._index_list) > 0:
-                        next_index = self._index_list[0]
-                except (ValueError, IndexError, AttributeError):
-                    pass
-            elif self.mode == Mode.RepeatTrack:
-                next_index = self.track_index
-            else:
-                if self.track_index + 1 < len(self.track_list):
-                    next_index = self.track_index + 1
-                elif self.mode == Mode.RepeatTrackList and len(self.track_list) > 0:
-                    next_index = 0
-
-            if next_index != -1 and next_index < len(self.track_list):
-                next_track = self.track_list[next_index]
-                if not next_track._is_fetched:
-                    logging.info(f"Prefetching next track: {next_track.name}")
-                    _ = next_track.url
-                    elapsed_ms = (time.perf_counter() - started_at) * 1000
+                    _ = candidate.url
                     logging.info(
                         "[PlaybackTiming] next_track_prefetch_completed "
-                        f"elapsed_ms={elapsed_ms:.2f} source=track_list "
-                        f"service={next_track.service} track={next_track.name!r}"
+                        f"elapsed_ms={(time.perf_counter() - started_at) * 1000:.2f} "
+                        f"service={candidate.service} track={candidate.name!r}"
                     )
-        except Exception as e:
-            elapsed_ms = (time.perf_counter() - started_at) * 1000
-            logging.warning(
-                "[PlaybackTiming] next_track_prefetch_failed "
-                f"elapsed_ms={elapsed_ms:.2f} error={e!r}"
-            )
+                except Exception as error:
+                    logging.warning("[PlaybackTiming] next_track_prefetch_failed error=%r", error)
         finally:
             self._prefetch_lock.release()
 
