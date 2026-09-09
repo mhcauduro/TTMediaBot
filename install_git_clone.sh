@@ -13,42 +13,81 @@ fi
 
 REPO_URL="https://github.com/JoaoDEVWHADS/TTMediaBot.git"
 
+# Retry package-manager commands when another apt/dpkg process temporarily holds a lock.
+run_with_retries() {
+    local max_attempts=30
+    local delay_seconds=10
+    local attempt=1
+
+    while true; do
+        if "$@"; then
+            return 0
+        fi
+
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "❌ Command failed after $max_attempts attempts: $*"
+            return 1
+        fi
+
+        echo "⚠️ Package manager is busy or the command failed. Retrying in ${delay_seconds}s... ($attempt/$max_attempts)"
+        sleep "$delay_seconds"
+        attempt=$((attempt + 1))
+    done
+}
+
 # Function to detect package manager and install packages
 install_packages() {
     local PKGS=("$@")
+
     if command -v apt-get &> /dev/null; then
-        apt-get update && apt-get install -y "${PKGS[@]}"
+        # apt may be temporarily locked by apt-daily/unattended-upgrades.
+        # Retry instead of continuing with missing dependencies.
+        run_with_retries apt-get update || return 1
+        run_with_retries apt-get -o DPkg::Lock::Timeout=300 install -y "${PKGS[@]}" || return 1
     elif command -v dnf &> /dev/null; then
-        dnf install -y "${PKGS[@]}"
+        dnf install -y "${PKGS[@]}" || return 1
     elif command -v yum &> /dev/null; then
-        yum install -y "${PKGS[@]}"
+        yum install -y "${PKGS[@]}" || return 1
     elif command -v pacman &> /dev/null; then
-        pacman -S --noconfirm "${PKGS[@]}"
+        pacman -S --noconfirm "${PKGS[@]}" || return 1
     elif command -v zypper &> /dev/null; then
-        zypper install -y "${PKGS[@]}"
+        zypper install -y "${PKGS[@]}" || return 1
     elif command -v apk &> /dev/null; then
-        apk add --no-cache "${PKGS[@]}"
+        apk add --no-cache "${PKGS[@]}" || return 1
     else
-        echo "Error: Package manager not found. Please install manually: ${PKGS[*]}"
-        exit 1
+        echo "❌ Error: Package manager not found. Please install manually: ${PKGS[*]}"
+        return 1
     fi
 }
 
+ensure_command() {
+    local command_name="$1"
+    local package_name="${2:-$1}"
+
+    if command -v "$command_name" &> /dev/null; then
+        echo "$command_name is already installed."
+        return 0
+    fi
+
+    echo "$command_name not found. Installing..."
+    if ! install_packages "$package_name"; then
+        echo "❌ Failed to install required dependency: $package_name"
+        exit 1
+    fi
+
+    if ! command -v "$command_name" &> /dev/null; then
+        echo "❌ $command_name is still unavailable after installation."
+        exit 1
+    fi
+
+    echo "✅ $command_name installed successfully."
+}
+
 echo "--- Checking for Git ---"
-if ! command -v git &> /dev/null; then
-    echo "Git not found. Installing..."
-    install_packages git
-else
-    echo "Git is already installed."
-fi
+ensure_command git git
 
 echo "--- Checking for unzip (ZIP extractor) ---"
-if ! command -v unzip &> /dev/null; then
-    echo "unzip not found. Installing..."
-    install_packages unzip
-else
-    echo "unzip is already installed."
-fi
+ensure_command unzip unzip
 
 # Detect if we are already inside the repository
 if [ -d ".git" ] && git remote get-url origin 2>/dev/null | grep -q "TTMediaBot"; then
