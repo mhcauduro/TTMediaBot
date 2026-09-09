@@ -1,5 +1,10 @@
 FROM python:3.10.12-slim-bullseye
 
+# Fix Debian Bullseye repositories and expired metadata
+RUN echo "deb http://deb.debian.org/debian bullseye main" > /etc/apt/sources.list \
+    && echo "deb http://deb.debian.org/debian bullseye-updates main" >> /etc/apt/sources.list \
+    && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+
 # Install system dependencies (matching install.sh)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
