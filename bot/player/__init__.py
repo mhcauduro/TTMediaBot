@@ -46,6 +46,7 @@ class Player:
             "ytdl": False,
         }
         mpv_options.update(self.config.player_options)
+        self._default_user_agent = mpv_options.get("user_agent", "")
         try:
             self._player = mpv.MPV(**mpv_options, log_handler=self.log_handler)
         except AttributeError:
@@ -153,24 +154,28 @@ class Player:
         # Apply headers dynamically if available in extra_info only when changed
         extra_info = getattr(self.track, "extra_info", None) or {}
         headers = extra_info.get("http_headers", {})
-        target_ua = headers.get("User-Agent") if headers else None
-        target_headers = [f"{k}: {v}" for k, v in headers.items() if k.lower() != "user-agent"] if headers else []
+        target_ua = headers.get("User-Agent") if headers else self._default_user_agent
+        target_headers = [
+            f"{key}: {value}"
+            for key, value in headers.items()
+            if key.lower() != "user-agent"
+        ]
 
-        if target_ua and self._current_user_agent != target_ua:
+        if self._current_user_agent != target_ua:
             try:
                 self._player.user_agent = target_ua
                 self._current_user_agent = target_ua
-                logging.debug(f"[Player] Dynamic User-Agent applied to MPV")
+                logging.debug("[Player] HTTP User-Agent applied to MPV")
             except Exception as e:
                 logging.debug(f"[Player] Failed to apply User-Agent to MPV: {e}")
 
-        if target_headers and self._current_header_fields != target_headers:
+        if self._current_header_fields != target_headers:
             try:
                 self._player.http_header_fields = target_headers
                 self._current_header_fields = target_headers
-                logging.debug(f"[Player] Dynamic headers applied to MPV")
+                logging.debug("[Player] HTTP headers applied to MPV")
             except Exception as e:
-                logging.debug(f"[Player] Failed to apply dynamic headers to MPV: {e}")
+                logging.debug(f"[Player] Failed to apply HTTP headers to MPV: {e}")
                 
         self._player.pause = False
         self._player.play(arg)

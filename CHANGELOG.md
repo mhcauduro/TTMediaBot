@@ -4,6 +4,14 @@ All notable updates to this fork are documented here, in reverse chronological o
 
 ---
 
+## 🔧 Unreleased — Generic Stream Resolver
+
+- Added an extensible page-to-media resolver registry for the `u` command.
+- Added GETEM player-page support by extracting embedded audio URLs and forwarding required HTTP headers to mpv.
+- Stopped sending unrelated non-YouTube URLs through the YouTube.js fallback service.
+- Reset per-track HTTP headers when playback moves back to a plain direct URL.
+- Added regression tests for GETEM HTML/JavaScript extraction, direct URL fallback, and mpv header cleanup.
+
 ## 🆕 v2.8.0 — "Unified Music Discovery & Expiry-Aware Playback" *(08/31/2026)*
 
 ### 🎵 Unified YouTube.js Discovery
