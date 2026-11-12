@@ -301,7 +301,7 @@ update_and_fix_permissions() {
     echo ""
 
     # 2. Check for Updates (GitHub API vs Local Date)
-    REPO_OWNER="JoaoDEVWHADS"
+    REPO_OWNER="mhcauduro"
     REPO_NAME="TTMediaBot"
     BRANCH="master"
     
@@ -549,14 +549,14 @@ update_and_fix_permissions() {
         # Always remove existing folder to force a fresh download on update
         rm -rf TeamTalk_DLL TeamTalk_DLL.zip
         
-        DLL_URL="https://github.com/JoaoDEVWHADS/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
+        DLL_URL="https://github.com/mhcauduro/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
         ARCH=$(uname -m)
         if [[ "$ARCH" == "aarch64" || "$ARCH" =~ ^arm ]]; then
             echo "ℹ️ ARM architecture detected ($ARCH). Using ARM DLL..."
-            DLL_URL="https://github.com/JoaoDEVWHADS/TTMediaBot/releases/download/downloadttdll/ttarm.zip"
+            DLL_URL="https://github.com/mhcauduro/TTMediaBot/releases/download/downloadttdll/ttarm.zip"
         else
             echo "ℹ️ x86_64/AMD64 architecture detected ($ARCH). Using x86 DLL..."
-            DLL_URL="https://github.com/JoaoDEVWHADS/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
+            DLL_URL="https://github.com/mhcauduro/TTMediaBot/releases/download/downloadttdll/TeamTalk_DLL.zip"
         fi
         DLL_FILE="TeamTalk_DLL.zip"
         

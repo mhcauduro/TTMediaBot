@@ -23,7 +23,7 @@ if command -v apt-get &> /dev/null; then
 
     # Node.js LTS Installation via NodeSource for APT
     echo "--- Configuring Node.js LTS Repository ---"
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+    curl -fsSL https://deb.nodesource.com/setup_26.x | sudo -E bash -
     sudo apt-get install -y nodejs
 
 elif command -v dnf &> /dev/null; then

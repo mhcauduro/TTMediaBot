@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+# YouTube responses can exceed Node's default 16 KiB response-header limit
+# (e.g. m.youtube.com sends many large Set-Cookie headers). Raising the limit
+# globally keeps the built-in fetch used by youtubei.js from failing with
+# UND_ERR_HEADERS_OVERFLOW.
+export NODE_OPTIONS="--max-http-header-size=1048576 ${NODE_OPTIONS:-}"
+
 POT_PROVIDER_PORT=${POT_PROVIDER_PORT:-4416}
 YOUTUBE_BRIDGE_PORT=${YOUTUBE_BRIDGE_PORT:-4417}
 export POT_PROVIDER_URL=${POT_PROVIDER_URL:-http://127.0.0.1:${POT_PROVIDER_PORT}/get_pot}

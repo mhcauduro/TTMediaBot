@@ -187,7 +187,7 @@ All notable updates to this fork are documented here, in reverse chronological o
 
 ### 🛡️ Dedicated Uninstaller Submenu (`uninstall.sh`)
 - **📜 Standalone Uninstaller:**
-  Extracted and refactored the uninstallation logic from `ttbotdocker.sh` into a standalone, fully English-localized script [`uninstall.sh`](file:///root/joao/TTMediaBot/uninstall.sh).
+  Extracted and refactored the uninstallation logic from `ttbotdocker.sh` into a standalone, fully English-localized script [`uninstall.sh`](file:///root/mhcauduro/TTMediaBot/uninstall.sh).
 - **🟢 Option 1 — Standard Uninstall (Safe & Recommended):**
   Removes **ONLY** TTMediaBot containers (labeled `role=ttmediabot`), the `ttmediabot` Docker image, bot data folders (`bots/`), the auto-updater systemd service, and temporary lock files. Preserves Docker Engine, system packages (`git`, `curl`, `jq`), and any other Docker projects on the server.
 - **🔴 Option 2 — Complete System Purge (DESTRUCTIVE):**

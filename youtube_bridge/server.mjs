@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs/promises';
 import { statSync } from 'node:fs';
 import path from 'node:path';
@@ -132,23 +133,74 @@ function pageConfigValue(page, key) {
   }
 }
 
+// YouTube's mobile home page ships >16 KiB of response headers (many Set-Cookie
+// entries). Node's built-in fetch/undici defaults to a 16 KiB maxHeaderSize and
+// throws UND_ERR_HEADERS_OVERFLOW, which used to break every resolve/download.
+// Use node:https with an explicit, generous limit instead.
+const SESSION_PAGE_MAX_HEADER_SIZE = 1024 * 1024;
+const SESSION_PAGE_TIMEOUT_MS = 15000;
+
+function httpsGetText(url, headers, { maxHeaderSize = SESSION_PAGE_MAX_HEADER_SIZE, timeoutMs = SESSION_PAGE_TIMEOUT_MS, redirectsLeft = 3 } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const request = https.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || 443,
+      path: `${target.pathname}${target.search}`,
+      method: 'GET',
+      headers,
+      maxHeaderSize
+    }, (response) => {
+      const status = response.statusCode || 0;
+      if (status >= 300 && status < 400 && response.headers.location && redirectsLeft > 0) {
+        response.resume();
+        resolve(httpsGetText(new URL(response.headers.location, target).toString(), headers, {
+          maxHeaderSize,
+          timeoutMs,
+          redirectsLeft: redirectsLeft - 1
+        }));
+        return;
+      }
+
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        status,
+        ok: status >= 200 && status < 300,
+        body: Buffer.concat(chunks).toString('utf8')
+      }));
+      response.on('error', reject);
+    });
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error('YouTube session page request timed out'));
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
 async function getWebSessionData(cookie) {
   if (!cookie) return {};
-  const response = await fetch('https://m.youtube.com/', {
-    headers: {
+  try {
+    const response = await httpsGetText('https://m.youtube.com/', {
       'Cookie': cookie,
       'User-Agent': USER_AGENT,
       'Accept-Language': 'en-US,en;q=0.9'
+    });
+    if (!response.ok) {
+      throw new Error(`YouTube session page returned HTTP ${response.status}`);
     }
-  });
-  if (!response.ok) {
-    throw new Error(`YouTube session page returned HTTP ${response.status}`);
+    return {
+      dataSyncId: pageConfigValue(response.body, 'DATASYNC_ID'),
+      visitorData: pageConfigValue(response.body, 'VISITOR_DATA')
+    };
+  } catch (error) {
+    // Session enrichment is optional (visitor data / data sync id). Never let it
+    // take resolve, info or download down; Innertube can still create a session.
+    console.warn(`[youtube-bridge] Could not read YouTube web session data (${error?.code || error?.message}); continuing without visitor data`);
+    return {};
   }
-  const page = await response.text();
-  return {
-    dataSyncId: pageConfigValue(page, 'DATASYNC_ID'),
-    visitorData: pageConfigValue(page, 'VISITOR_DATA')
-  };
 }
 
 async function getSession(cookieFile) {
