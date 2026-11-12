@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import { statSync } from 'node:fs';
 import path from 'node:path';
@@ -799,22 +800,221 @@ async function getDownloadPlan(body) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Range-chunked streaming proxy
+//
+// googlevideo now answers 403 to any request that is not a *bounded* Range
+// request of at most 1 MiB ("rqh=1" PO-token enforcement). ffmpeg/libmpv always
+// open a remote file with `Range: bytes=0-` (or without any Range header), so
+// every track died right after `start-file` with "loading failed (reason 4)".
+//
+// Instead of handing the googlevideo URL to mpv, /resolve and /download-plan
+// return a bridge URL. The bridge fetches the upstream media in <=1 MiB chunks
+// and exposes it as a regular HTTP resource with full Range support, so mpv and
+// ffmpeg keep working unchanged.
+// ---------------------------------------------------------------------------
+const STREAM_CHUNK_SIZE = 1024 * 1024;
+const STREAM_TTL_MS = 6 * 60 * 60 * 1000;
+const STREAM_REGISTRY_MAX = 4096;
+const streamRegistry = new Map();
+let streamSequence = 0;
+
+function registerStreamDescriptor(payload) {
+  const now = Date.now();
+  for (const [key, value] of streamRegistry) {
+    if (value.expiresAt <= now) streamRegistry.delete(key);
+  }
+  while (streamRegistry.size >= STREAM_REGISTRY_MAX) {
+    streamRegistry.delete(streamRegistry.keys().next().value);
+  }
+
+  const id = `${(streamSequence++).toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  streamRegistry.set(id, {
+    url: payload.url,
+    mimeType: payload.mime_type || 'application/octet-stream',
+    contentLength: Number(payload.content_length) || 0,
+    headers: payload.http_headers || {},
+    expiresAt: now + STREAM_TTL_MS
+  });
+  return id;
+}
+
+function proxiedStreamUrl(req, payload) {
+  const host = req?.headers?.host || `${HOST}:${PORT}`;
+  return `http://${host}/stream/${registerStreamDescriptor(payload)}`;
+}
+
+function parseByteRange(headerValue, total) {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(String(headerValue || '').trim());
+  if (!match) return null;
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === '' && rawEnd === '') return null;
+
+  let start;
+  let end;
+  if (rawStart === '') {
+    const suffix = Number(rawEnd);
+    if (!Number.isFinite(suffix) || suffix <= 0) return null;
+    start = Math.max(0, total - suffix);
+    end = total - 1;
+  } else {
+    start = Number(rawStart);
+    end = rawEnd === '' ? total - 1 : Math.min(Number(rawEnd), total - 1);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  if (start < 0 || start > end || start >= total) return null;
+  return { start, end };
+}
+
+function upstreamRequestHeaders(descriptor, start, end) {
+  const headers = {
+    'accept': '*/*',
+    'accept-encoding': 'identity',
+    'user-agent': USER_AGENT,
+    'range': `bytes=${start}-${end}`
+  };
+  for (const [key, value] of Object.entries(descriptor.headers || {})) {
+    if (key.toLowerCase() !== 'user-agent') headers[key.toLowerCase()] = value;
+  }
+  return headers;
+}
+
+function fetchUpstreamRange(descriptor, start, end) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(new URL(descriptor.url), {
+      method: 'GET',
+      headers: upstreamRequestHeaders(descriptor, start, end)
+    }, resolve);
+    request.on('error', reject);
+    request.setTimeout(30000, () => request.destroy(new Error('Upstream request timed out')));
+    request.end();
+  });
+}
+
+async function probeUpstreamContentLength(descriptor) {
+  const upstream = await fetchUpstreamRange(descriptor, 0, 0);
+  const status = upstream.statusCode || 0;
+  try {
+    if (status === 206) {
+      const match = /\/(\d+)\s*$/.exec(upstream.headers['content-range'] || '');
+      if (match) return Number(match[1]);
+    }
+    if (status === 200) return Number(upstream.headers['content-length']) || 0;
+    throw new Error(`Upstream probe responded HTTP ${status}`);
+  } finally {
+    upstream.resume();
+  }
+}
+
+async function pipeUpstreamChunks(descriptor, res, start, end) {
+  let position = start;
+  while (position <= end && !res.destroyed) {
+    const chunkEnd = Math.min(position + STREAM_CHUNK_SIZE - 1, end);
+    const upstream = await fetchUpstreamRange(descriptor, position, chunkEnd);
+    const status = upstream.statusCode || 0;
+    if (status !== 206 && status !== 200) {
+      upstream.resume();
+      throw new Error(`Upstream responded HTTP ${status}`);
+    }
+    if (status === 200 && position > 0) {
+      upstream.resume();
+      throw new Error('Upstream ignored the Range header');
+    }
+
+    const expected = chunkEnd - position + 1;
+    let served = 0;
+    for await (const chunk of upstream) {
+      if (res.destroyed) {
+        upstream.destroy();
+        return;
+      }
+      const room = expected - served;
+      if (room <= 0) break;
+      const data = chunk.length > room ? chunk.subarray(0, room) : chunk;
+      served += data.length;
+      if (!res.write(data)) {
+        await Promise.race([once(res, 'drain'), once(res, 'close')]);
+      }
+      if (res.destroyed) {
+        upstream.destroy();
+        return;
+      }
+    }
+    if (status === 200) break;
+    if (served === 0) break;
+    position += served;
+  }
+}
+
+async function handleStreamRequest(req, res, id) {
+  const descriptor = streamRegistry.get(id);
+  if (!descriptor || descriptor.expiresAt <= Date.now()) {
+    streamRegistry.delete(id);
+    return json(res, 404, { error: 'Stream not found or expired' });
+  }
+
+  if (!descriptor.contentLength) {
+    descriptor.contentLength = await probeUpstreamContentLength(descriptor);
+  }
+  const total = descriptor.contentLength;
+  if (!total) return json(res, 502, { error: 'Upstream did not report a content length' });
+
+  const requested = parseByteRange(req.headers.range, total);
+  const start = requested ? requested.start : 0;
+  const end = requested ? requested.end : total - 1;
+
+  res.writeHead(requested ? 206 : 200, {
+    'content-type': descriptor.mimeType,
+    'accept-ranges': 'bytes',
+    'content-length': end - start + 1,
+    'cache-control': 'no-store',
+    ...(requested ? { 'content-range': `bytes ${start}-${end}/${total}` } : {})
+  });
+  if (req.method === 'HEAD') return res.end();
+
+  try {
+    await pipeUpstreamChunks(descriptor, res, start, end);
+    res.end();
+  } catch (error) {
+    console.warn(`[youtube-bridge] stream ${id} failed: ${error.message}`);
+    if (!res.headersSent) json(res, 502, { error: error.message });
+    else res.destroy(error);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
       return json(res, 200, { ok: true, version: '2' });
     }
+    const streamMatch = (req.method === 'GET' || req.method === 'HEAD')
+      ? /^\/stream\/([A-Za-z0-9]+)$/.exec(req.url || '')
+      : null;
+    if (streamMatch) return await handleStreamRequest(req, res, streamMatch[1]);
     if (req.method !== 'POST') return json(res, 404, { error: 'Not found' });
 
     const body = await readBody(req);
     body.cookie_file = getBotCookieFile(body.bot_id);
-    if (req.url === '/resolve') return json(res, 200, await resolveTrack(body));
+    if (req.url === '/resolve') {
+      const payload = { ...(await resolveTrack(body)) };
+      if (payload.url) payload.url = proxiedStreamUrl(req, payload);
+      return json(res, 200, payload);
+    }
     if (req.url === '/invalidate') return json(res, 200, invalidateResolution(body));
     if (req.url === '/info') return json(res, 200, await getInfo(body));
     if (req.url === '/playlist') return json(res, 200, await getPlaylist(body));
     if (req.url === '/search') return json(res, 200, await searchVideos(body));
     if (req.url === '/recommendations') return json(res, 200, await getMusicRecommendations(body));
-    if (req.url === '/download-plan') return json(res, 200, await getDownloadPlan(body));
+    if (req.url === '/download-plan') {
+      const plan = await getDownloadPlan(body);
+      for (const key of ['audio', 'video']) {
+        const entry = plan?.[key];
+        if (entry?.url) {
+          entry.url = proxiedStreamUrl(req, { ...entry, http_headers: plan.http_headers });
+        }
+      }
+      return json(res, 200, plan);
+    }
     return json(res, 404, { error: 'Not found' });
   } catch (error) {
     console.error('[youtube-bridge]', error);
