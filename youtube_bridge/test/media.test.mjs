@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  formatFromYtDlpUrl,
   musicItemPayload,
   normalizeSearchKey,
   pickBestAudioFormat,
   streamCacheTtlMs,
-  validationProbeRanges
+  validationProbeRanges,
+  ytDlpFormatSelector
 } from '../media.mjs';
 
 test('normalizes equivalent search queries per mode', () => {
@@ -109,4 +111,43 @@ test('handles tiny and unknown content lengths', () => {
   assert.deepEqual(validationProbeRanges(0, 1024, 64), [[0, 0]]);
   assert.deepEqual(validationProbeRanges(1, 1024, 64), [[0, 0]]);
   assert.deepEqual(rangesFor(1024), ['0-0', '1023-1023']);
+});
+
+test('builds the yt-dlp format selector for audio and video', () => {
+  assert.equal(ytDlpFormatSelector(undefined), 'bestaudio/best');
+  assert.equal(ytDlpFormatSelector({ type: 'audio' }), 'bestaudio/best');
+  assert.equal(ytDlpFormatSelector({ type: 'audio', format: 'any' }), 'bestaudio/best');
+  assert.equal(ytDlpFormatSelector({ type: 'audio', format: 'mp4' }), 'bestaudio[ext=m4a]/bestaudio/best');
+  assert.equal(ytDlpFormatSelector({ type: 'video' }), 'bestvideo/best');
+  assert.equal(ytDlpFormatSelector({ type: 'video', format: 'mp4' }), 'bestvideo[ext=mp4]/bestvideo/best');
+});
+
+test('parses a yt-dlp audio URL into a bridge format', () => {
+  const url =
+    'https://rr5---sn-test.googlevideo.com/videoplayback?itag=251&mime=audio%2Fwebm&bitrate=156272&clen=3340840&dur=180';
+  assert.deepEqual(formatFromYtDlpUrl(url), {
+    url,
+    itag: 251,
+    mime_type: 'audio/webm',
+    bitrate: 156272,
+    average_bitrate: 156272,
+    content_length: 3340840,
+    quality: '',
+    quality_label: '',
+    audio_quality: '',
+    audio_sample_rate: 0,
+    audio_channels: 0,
+    has_audio: true,
+    has_video: false
+  });
+});
+
+test('marks yt-dlp video-only URLs as video', () => {
+  const format = formatFromYtDlpUrl(
+    'https://rr5---sn-test.googlevideo.com/videoplayback?itag=401&mime=video%2Fmp4&clen=240334643'
+  );
+  assert.equal(format.mime_type, 'video/mp4');
+  assert.equal(format.has_video, true);
+  assert.equal(format.has_audio, false);
+  assert.equal(format.content_length, 240334643);
 });

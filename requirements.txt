@@ -6,3 +6,4 @@ pydantic
 pyshorteners
 requests
 httpx[http2]
+yt-dlp>=2026.10.21

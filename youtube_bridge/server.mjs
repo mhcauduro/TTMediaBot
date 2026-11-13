@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import { once } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import { statSync } from 'node:fs';
 import path from 'node:path';
@@ -8,11 +10,13 @@ import { URL } from 'node:url';
 import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
 import {
+  formatFromYtDlpUrl,
   musicItemPayload,
   normalizeSearchKey,
   pickBestAudioFormat,
   streamCacheTtlMs,
-  validationProbeRanges
+  validationProbeRanges,
+  ytDlpFormatSelector
 } from './media.mjs';
 
 const HOST = process.env.YOUTUBE_BRIDGE_HOST || '127.0.0.1';
@@ -21,6 +25,10 @@ const POT_URL = process.env.POT_PROVIDER_URL || 'http://127.0.0.1:4416/get_pot';
 const BOTS_ROOT = path.resolve(process.env.TTMEDIABOT_BOTS_ROOT || '/bots');
 const USER_AGENT = process.env.YOUTUBE_BRIDGE_USER_AGENT ||
   'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Version/18.5 Mobile/15E148 Safari/604.1';
+const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
+const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
+const YTDLP_MAX_BUFFER = 4 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
 
 // YouTube.js 18 requires an evaluator to decipher player signatures/nsig.
 Platform.shim.eval = async (data) => new Function(data.output)();
@@ -236,7 +244,11 @@ async function getSession(cookieFile) {
       generate_session_locally: true,
       retrieve_player: true
     });
-    return { session };
+    // Web-family clients must bind the PO Token to the session's visitor data,
+    // not to the video id. A token minted for the video id is rejected by
+    // googlevideo with HTTP 403 even on the very first byte.
+    const poBinding = session.session?.context?.client?.visitorData || undefined;
+    return { session, poBinding };
   })().catch((error) => {
     sessionCache.delete(key);
     throw error;
@@ -400,18 +412,55 @@ function chooseFormatForOptions(info, formatOptions) {
   return pickBestAudioFormat(info, { mimeIncludes }) || info.chooseFormat(formatOptions);
 }
 
-async function resolveFormat(context, videoId, requestedClient, formatOptions, { forceFresh = false } = {}) {
+// yt-dlp extracts googlevideo URLs that do not carry the `n`/`pot` query
+// parameters produced by youtubei.js. Those parameters are exactly what makes
+// YouTube answer 403 for every range past the first MiB, so yt-dlp is used as
+// the primary resolver and youtubei.js only as a fallback.
+async function resolveWithYtDlp(videoId, formatOptions) {
+  const startedAt = performance.now();
+  const selector = ytDlpFormatSelector(formatOptions);
+  const { stdout } = await execFileAsync(YTDLP_BIN, [
+    '--ignore-config',
+    '--quiet',
+    '--no-warnings',
+    '--no-playlist',
+    '--js-runtimes', 'node',
+    '-f', selector,
+    '-g',
+    `https://www.youtube.com/watch?v=${videoId}`
+  ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
+
+  const streamUrl = String(stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^https?:\/\//i.test(line));
+  if (!streamUrl) throw new Error('yt-dlp returned no stream URL');
+  if (/\.m3u8|\.mpd(\?|$)/i.test(streamUrl)) {
+    throw new Error('yt-dlp returned a manifest instead of a direct media URL');
+  }
+
+  const format = formatFromYtDlpUrl(streamUrl);
+  const headers = { 'User-Agent': USER_AGENT };
+  const validatedLength = await validateStreamUrl(streamUrl, headers, format.content_length);
+  if (validatedLength) format.content_length = validatedLength;
+
+  const duration = Number(new URL(streamUrl).searchParams.get('dur')) || 0;
+  const info = { basic_info: { id: videoId, duration } };
+  console.log(`[youtube-bridge] yt-dlp resolved ${videoId} itag=${format.itag} mime=${format.mime_type} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+  return { info, format, client: 'YTDLP' };
+}
+
+async function resolveWithInnertube(context, videoId, requestedClient, formatOptions, { forceFresh = false } = {}) {
   // WEB is SABR-only for many videos in 2026. MWEB still exposes classic
   // adaptive formats and is the preferred web playback client here. TV clients
   // currently return LOGIN_REQUIRED/UNPLAYABLE, so they are not worth a try.
-  const clients = requestedClient === 'YTMUSIC'
-    ? ['YTMUSIC', 'MWEB']
-    : ['MWEB'];
+  const clients = ['MWEB'];
+  const attempts = 2;
   const failures = [];
   const { session } = context;
+  const contentBinding = context.poBinding || videoId;
 
   for (const client of clients) {
-    const attempts = 3;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const attemptStartedAt = performance.now();
       try {
@@ -419,7 +468,7 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions, {
         // Every retry asks for a brand-new PO token: a range-limited URL is
         // tied to the token that minted it, so replaying the cached token
         // would just reproduce the same broken stream.
-        const poToken = await getPoToken(videoId, { forceFresh: forceFresh || attempt > 1 });
+        const poToken = await getPoToken(contentBinding, { forceFresh: forceFresh || attempt > 1 });
         console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=po-token elapsed_ms=${Math.round(performance.now() - poStartedAt)} available=${Boolean(poToken)}`);
 
         const playerStartedAt = performance.now();
@@ -431,6 +480,7 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions, {
 
         const formatStartedAt = performance.now();
         const format = chooseFormatForOptions(info, formatOptions);
+        if (!format) throw new Error('no playable format returned');
         console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=choose-format elapsed_ms=${Math.round(performance.now() - formatStartedAt)} itag=${format.itag} bitrate=${format.average_bitrate || format.bitrate || 0}`);
         if (!session.session.player) {
           throw new Error('YouTube player is unavailable');
@@ -465,7 +515,7 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions, {
         failures.push(`${client}#${attempt}: ${message}`);
         console.warn(`[youtube-bridge] ${videoId} client=${client} attempt=${attempt}/${attempts} failed: ${message}`);
         // A rejected URL is usually transient, so ask for a fresh PO token and
-        // URL for the same client before falling back to a different client.
+        // URL for the same client before giving up.
         if (error?.code === 'STREAM_VALIDATION_FAILED' && attempt < attempts) {
           continue;
         }
@@ -474,7 +524,21 @@ async function resolveFormat(context, videoId, requestedClient, formatOptions, {
     }
   }
 
-  throw new Error(`Unable to resolve stream for ${videoId}; ${failures.join(' | ')}`);
+  throw new Error(failures.join(' | '));
+}
+
+async function resolveFormat(context, videoId, requestedClient, formatOptions, options = {}) {
+  try {
+    return await resolveWithYtDlp(videoId, formatOptions);
+  } catch (error) {
+    const message = error?.message || String(error);
+    console.warn(`[youtube-bridge] yt-dlp resolve failed for ${videoId}: ${message}`);
+    try {
+      return await resolveWithInnertube(context, videoId, requestedClient, formatOptions, options);
+    } catch (innerError) {
+      throw new Error(`Unable to resolve stream for ${videoId}; YTDLP: ${message} | ${innerError.message}`);
+    }
+  }
 }
 
 async function resolveTrack(body) {

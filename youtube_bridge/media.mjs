@@ -91,3 +91,39 @@ export function validationProbeRanges(contentLength, chunkSize, probeBytes) {
     [secondChunkStart, Math.min(secondChunkStart + probe - 1, last)]
   ];
 }
+
+// yt-dlp is the bridge's primary resolver: it produces googlevideo URLs without
+// the `n`/`pot` parameters that youtubei.js adds, and those parameters are what
+// make YouTube reject every range past the first MiB.
+export function ytDlpFormatSelector(formatOptions) {
+  const type = formatOptions?.type === 'video' ? 'video' : 'audio';
+  const wantsMp4 = String(formatOptions?.format || '').toLowerCase() === 'mp4';
+  if (type === 'video') {
+    return wantsMp4 ? 'bestvideo[ext=mp4]/bestvideo/best' : 'bestvideo/best';
+  }
+  // bestaudio is the highest-bitrate audio-only format available. The mp4
+  // variant (m4a) is only requested when the caller explicitly asks for it.
+  return wantsMp4 ? 'bestaudio[ext=m4a]/bestaudio/best' : 'bestaudio/best';
+}
+
+export function formatFromYtDlpUrl(streamUrl) {
+  const parsed = new URL(streamUrl);
+  const params = parsed.searchParams;
+  const mimeType = decodeURIComponent(params.get('mime') || '');
+  const isVideoOnly = /^video\//i.test(mimeType);
+  return {
+    url: streamUrl,
+    itag: Number(params.get('itag')) || 0,
+    mime_type: mimeType,
+    bitrate: Number(params.get('bitrate')) || 0,
+    average_bitrate: Number(params.get('bitrate')) || 0,
+    content_length: Number(params.get('clen')) || 0,
+    quality: '',
+    quality_label: '',
+    audio_quality: '',
+    audio_sample_rate: 0,
+    audio_channels: 0,
+    has_audio: !isVideoOnly,
+    has_video: isVideoOnly
+  };
+}
