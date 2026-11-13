@@ -4,7 +4,9 @@ import test from 'node:test';
 import {
   musicItemPayload,
   normalizeSearchKey,
-  streamCacheTtlMs
+  pickBestAudioFormat,
+  streamCacheTtlMs,
+  validationProbeRanges
 } from '../media.mjs';
 
 test('normalizes equivalent search queries per mode', () => {
@@ -60,4 +62,51 @@ test('caps long stream validity and rejects already unsafe URLs', () => {
   assert.equal(streamCacheTtlMs(`https://x.test/?expire=${farExpiry}`, nowMs), 3_600_000);
   assert.equal(streamCacheTtlMs(`https://x.test/?expire=${nearExpiry}`, nowMs), 0);
   assert.equal(streamCacheTtlMs('https://x.test/no-expiry', nowMs), 300_000);
+});
+
+test('picks the highest-bitrate audio and prefers Opus on ties', () => {
+  const formats = [
+    { itag: 140, mime_type: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 129000, average_bitrate: 128000, has_audio: true },
+    { itag: 251, mime_type: 'audio/webm; codecs="opus"', bitrate: 160000, average_bitrate: 160000, has_audio: true },
+    { itag: 250, mime_type: 'audio/webm; codecs="opus"', bitrate: 70000, average_bitrate: 70000, has_audio: true },
+    { itag: 999, mime_type: 'audio/webm; codecs="opus"', bitrate: 160000, average_bitrate: 160000, has_audio: true }
+  ];
+
+  assert.equal(pickBestAudioFormat({ streaming_data: { adaptive_formats: formats } }).itag, 251);
+
+  const tie = [
+    { itag: 140, mime_type: 'audio/mp4; codecs="mp4a.40.2"', average_bitrate: 160000, has_audio: true },
+    { itag: 251, mime_type: 'audio/webm; codecs="opus"', average_bitrate: 160000, has_audio: true }
+  ];
+  assert.equal(pickBestAudioFormat({ streaming_data: { adaptive_formats: tie } }).itag, 251);
+});
+
+test('honours a requested audio container when available', () => {
+  const info = {
+    streaming_data: {
+      adaptive_formats: [
+        { itag: 251, mime_type: 'audio/webm; codecs="opus"', average_bitrate: 160000, has_audio: true },
+        { itag: 140, mime_type: 'audio/mp4; codecs="mp4a.40.2"', average_bitrate: 128000, has_audio: true }
+      ]
+    }
+  };
+  assert.equal(pickBestAudioFormat(info, { mimeIncludes: 'mp4' }).itag, 140);
+});
+
+function rangesFor(total) {
+  return validationProbeRanges(total, 1024 * 1024, 1024 * 1024)
+    .map(([start, end]) => `${start}-${end}`);
+}
+
+test('validates the URL start and a full second chunk', () => {
+  assert.deepEqual(rangesFor(4_085_104), [
+    '0-0',
+    '1048576-2097151'
+  ]);
+});
+
+test('handles tiny and unknown content lengths', () => {
+  assert.deepEqual(validationProbeRanges(0, 1024, 64), [[0, 0]]);
+  assert.deepEqual(validationProbeRanges(1, 1024, 64), [[0, 0]]);
+  assert.deepEqual(rangesFor(1024), ['0-0', '1023-1023']);
 });

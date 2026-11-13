@@ -7,7 +7,13 @@ import path from 'node:path';
 import { URL } from 'node:url';
 import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
-import { musicItemPayload, normalizeSearchKey, streamCacheTtlMs } from './media.mjs';
+import {
+  musicItemPayload,
+  normalizeSearchKey,
+  pickBestAudioFormat,
+  streamCacheTtlMs,
+  validationProbeRanges
+} from './media.mjs';
 
 const HOST = process.env.YOUTUBE_BRIDGE_HOST || '127.0.0.1';
 const PORT = Number(process.env.YOUTUBE_BRIDGE_PORT || 4417);
@@ -260,12 +266,15 @@ async function getSearchSession() {
   return searchSessionPromise;
 }
 
-async function getPoToken(contentBinding) {
+async function getPoToken(contentBinding, { forceFresh = false } = {}) {
   try {
     const response = await fetch(POT_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ content_binding: contentBinding })
+      body: JSON.stringify({
+        content_binding: contentBinding,
+        ...(forceFresh ? { bypass_cache: true } : {})
+      })
     });
     if (!response.ok) {
       const body = await response.text();
@@ -383,53 +392,85 @@ function playabilityDescription(info) {
   return reason ? `${status}: ${reason}` : status;
 }
 
-async function resolveFormat(context, videoId, requestedClient, formatOptions) {
+function chooseFormatForOptions(info, formatOptions) {
+  if (formatOptions?.type !== 'audio') return info.chooseFormat(formatOptions);
+  const mimeIncludes = formatOptions.format && formatOptions.format !== 'any'
+    ? formatOptions.format
+    : '';
+  return pickBestAudioFormat(info, { mimeIncludes }) || info.chooseFormat(formatOptions);
+}
+
+async function resolveFormat(context, videoId, requestedClient, formatOptions, { forceFresh = false } = {}) {
   // WEB is SABR-only for many videos in 2026. MWEB still exposes classic
-  // adaptive formats and is the preferred web playback client here.
+  // adaptive formats and is the preferred web playback client here. TV clients
+  // currently return LOGIN_REQUIRED/UNPLAYABLE, so they are not worth a try.
   const clients = requestedClient === 'YTMUSIC'
-    ? ['YTMUSIC', 'MWEB', ClientType.TV_EMBEDDED]
-    : ['MWEB', ClientType.TV_EMBEDDED];
+    ? ['YTMUSIC', 'MWEB']
+    : ['MWEB'];
   const failures = [];
   const { session } = context;
 
   for (const client of clients) {
-    const clientStartedAt = performance.now();
-    try {
-      const poStartedAt = performance.now();
-      const poToken = client === ClientType.TV_EMBEDDED
-        ? undefined
-        : await getPoToken(videoId);
-      console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=po-token elapsed_ms=${Math.round(performance.now() - poStartedAt)} available=${Boolean(poToken)}`);
+    const attempts = 3;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const attemptStartedAt = performance.now();
+      try {
+        const poStartedAt = performance.now();
+        // Every retry asks for a brand-new PO token: a range-limited URL is
+        // tied to the token that minted it, so replaying the cached token
+        // would just reproduce the same broken stream.
+        const poToken = await getPoToken(videoId, { forceFresh: forceFresh || attempt > 1 });
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=po-token elapsed_ms=${Math.round(performance.now() - poStartedAt)} available=${Boolean(poToken)}`);
 
-      const playerStartedAt = performance.now();
-      const info = await getPlayableInfo(session, videoId, client, poToken);
-      console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=player elapsed_ms=${Math.round(performance.now() - playerStartedAt)} status=${info?.playability_status?.status || 'UNKNOWN'}`);
-      if (!info?.streaming_data) {
-        throw new Error(`no streaming data (${playabilityDescription(info)})`);
+        const playerStartedAt = performance.now();
+        const info = await getPlayableInfo(session, videoId, client, poToken);
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=player elapsed_ms=${Math.round(performance.now() - playerStartedAt)} status=${info?.playability_status?.status || 'UNKNOWN'}`);
+        if (!info?.streaming_data) {
+          throw new Error(`no streaming data (${playabilityDescription(info)})`);
+        }
+
+        const formatStartedAt = performance.now();
+        const format = chooseFormatForOptions(info, formatOptions);
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=choose-format elapsed_ms=${Math.round(performance.now() - formatStartedAt)} itag=${format.itag} bitrate=${format.average_bitrate || format.bitrate || 0}`);
+        if (!session.session.player) {
+          throw new Error('YouTube player is unavailable');
+        }
+
+        session.session.player.po_token = poToken;
+        const decipherStartedAt = performance.now();
+        format.url = await format.decipher(session.session.player);
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=decipher elapsed_ms=${Math.round(performance.now() - decipherStartedAt)}`);
+
+        if (!format.url) {
+          throw new Error('decipher returned an empty stream URL');
+        }
+
+        // Never hand a URL to the bot before proving it can serve a full chunk
+        // past the first MiB. Range-limited URLs answer `bytes=0-0` and small
+        // probes fine, then 403 on the real second chunk.
+        const validateStartedAt = performance.now();
+        const validatedLength = await validateStreamUrl(
+          format.url,
+          { 'User-Agent': USER_AGENT },
+          format.content_length,
+          { isLive: Boolean(info?.basic_info?.is_live || info?.basic_info?.is_live_content) }
+        );
+        if (validatedLength) format.content_length = validatedLength;
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=validate elapsed_ms=${Math.round(performance.now() - validateStartedAt)}`);
+
+        console.log(`[youtube-bridge] resolved ${videoId} with client=${client} itag=${format.itag} elapsed_ms=${Math.round(performance.now() - attemptStartedAt)}`);
+        return { info, format, client };
+      } catch (error) {
+        const message = error?.message || String(error);
+        failures.push(`${client}#${attempt}: ${message}`);
+        console.warn(`[youtube-bridge] ${videoId} client=${client} attempt=${attempt}/${attempts} failed: ${message}`);
+        // A rejected URL is usually transient, so ask for a fresh PO token and
+        // URL for the same client before falling back to a different client.
+        if (error?.code === 'STREAM_VALIDATION_FAILED' && attempt < attempts) {
+          continue;
+        }
+        break;
       }
-
-      const formatStartedAt = performance.now();
-      const format = info.chooseFormat(formatOptions);
-      console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=choose-format elapsed_ms=${Math.round(performance.now() - formatStartedAt)} itag=${format.itag}`);
-      if (!session.session.player) {
-        throw new Error('YouTube player is unavailable');
-      }
-
-      session.session.player.po_token = poToken;
-      const decipherStartedAt = performance.now();
-      format.url = await format.decipher(session.session.player);
-      console.log(`[youtube-bridge-timing] video=${videoId} client=${client} stage=decipher elapsed_ms=${Math.round(performance.now() - decipherStartedAt)}`);
-
-      if (!format.url) {
-        throw new Error('decipher returned an empty stream URL');
-      }
-
-      console.log(`[youtube-bridge] resolved ${videoId} with client=${client} itag=${format.itag} elapsed_ms=${Math.round(performance.now() - clientStartedAt)}`);
-      return { info, format, client };
-    } catch (error) {
-      const message = error?.message || String(error);
-      failures.push(`${client}: ${message}`);
-      console.warn(`[youtube-bridge] ${videoId} client=${client} failed: ${message}`);
     }
   }
 
@@ -577,7 +618,7 @@ async function getPlaylist(body) {
   };
 }
 
-async function searchVideos(body) {
+async function searchVideos(body, req) {
   const query = String(body.query || '').trim();
   if (!query) throw new Error('Search query is required');
   const limit = Math.min(Math.max(Number(body.limit) || 10, 1), 50);
@@ -679,13 +720,19 @@ async function searchVideos(body) {
     const topVideoId = results[0].videoId || results[0].id;
     if (topVideoId) {
       const requestedClient = mode === 'music' ? 'YTMUSIC' : 'MWEB';
+      const streamContext = {
+        videoId: topVideoId,
+        client: requestedClient,
+        botId: body.bot_id,
+        cookieFile: body.cookie_file
+      };
       const cacheKey = `${cookieFileKey(body.cookie_file)}:${requestedClient}:${topVideoId}`;
       const cached = resolveCache.get(cacheKey);
       if (cached && cached.url) {
         results[0] = {
           ...results[0],
           ...cached,
-          stream_url: cached.url
+          stream_url: proxiedStreamUrl(req, cached, streamContext)
         };
       } else {
         try {
@@ -698,7 +745,7 @@ async function searchVideos(body) {
             results[0] = {
               ...results[0],
               ...resolved,
-              stream_url: resolved.url
+              stream_url: proxiedStreamUrl(req, resolved, streamContext)
             };
           }
         } catch (err) {
@@ -783,12 +830,13 @@ async function getDownloadPlan(body) {
 
   let audioResult;
   try {
+    // Prefer the highest-bitrate audio (normally Opus) instead of forcing AAC.
     audioResult = await resolveFormat(context, videoId, requestedClient, {
-      type: 'audio', quality: 'best', format: 'mp4'
+      type: 'audio', quality: 'best', format: 'any'
     });
   } catch {
     audioResult = await resolveFormat(context, videoId, requestedClient, {
-      type: 'audio', quality: 'best', format: 'any'
+      type: 'audio', quality: 'best', format: 'mp4'
     });
   }
 
@@ -814,12 +862,18 @@ async function getDownloadPlan(body) {
 // ffmpeg keep working unchanged.
 // ---------------------------------------------------------------------------
 const STREAM_CHUNK_SIZE = 1024 * 1024;
+// Read a full chunk when validating: YouTube sometimes hands out URLs that
+// serve the first ~1 MiB and then 403 on every later range. A 64 KiB probe
+// passes those URLs, a full 1 MiB probe rejects them.
+const STREAM_VALIDATION_PROBE_BYTES = STREAM_CHUNK_SIZE;
+const STREAM_VALIDATION_TIMEOUT_MS = 10000;
+const STREAM_REFRESH_MAX_ATTEMPTS = 2;
 const STREAM_TTL_MS = 6 * 60 * 60 * 1000;
 const STREAM_REGISTRY_MAX = 4096;
 const streamRegistry = new Map();
 let streamSequence = 0;
 
-function registerStreamDescriptor(payload) {
+function registerStreamDescriptor(payload, context = {}) {
   const now = Date.now();
   for (const [key, value] of streamRegistry) {
     if (value.expiresAt <= now) streamRegistry.delete(key);
@@ -834,14 +888,20 @@ function registerStreamDescriptor(payload) {
     mimeType: payload.mime_type || 'application/octet-stream',
     contentLength: Number(payload.content_length) || 0,
     headers: payload.http_headers || {},
+    videoId: context.videoId || payload.videoId || payload.video_id || payload.id || '',
+    requestedClient: context.client || payload.client || '',
+    botId: context.botId || '',
+    cookieFile: context.cookieFile || '',
+    refreshCount: 0,
+    refreshPromise: null,
     expiresAt: now + STREAM_TTL_MS
   });
   return id;
 }
 
-function proxiedStreamUrl(req, payload) {
+function proxiedStreamUrl(req, payload, context = {}) {
   const host = req?.headers?.host || `${HOST}:${PORT}`;
-  return `http://${host}/stream/${registerStreamDescriptor(payload)}`;
+  return `http://${host}/stream/${registerStreamDescriptor(payload, context)}`;
 }
 
 function parseByteRange(headerValue, total) {
@@ -879,16 +939,22 @@ function upstreamRequestHeaders(descriptor, start, end) {
   return headers;
 }
 
-function fetchUpstreamRange(descriptor, start, end) {
+function fetchUpstreamRange(descriptor, start, end, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const request = https.request(new URL(descriptor.url), {
       method: 'GET',
       headers: upstreamRequestHeaders(descriptor, start, end)
     }, resolve);
     request.on('error', reject);
-    request.setTimeout(30000, () => request.destroy(new Error('Upstream request timed out')));
+    request.setTimeout(timeoutMs, () => request.destroy(new Error('Upstream request timed out')));
     request.end();
   });
+}
+
+function discardUpstream(upstream) {
+  if (!upstream) return;
+  upstream.on('error', () => {});
+  upstream.destroy();
 }
 
 async function probeUpstreamContentLength(descriptor) {
@@ -906,18 +972,132 @@ async function probeUpstreamContentLength(descriptor) {
   }
 }
 
+async function validateStreamUrl(url, headers, contentLength, { isLive = false } = {}) {
+  // Live streams do not have a stable content length / random-access window;
+  // probing them can reject perfectly valid manifests, so leave them untouched.
+  if (isLive) return 0;
+
+  const descriptor = {
+    url,
+    headers: headers || {},
+    contentLength: Number(contentLength) || 0
+  };
+  if (!descriptor.contentLength) {
+    descriptor.contentLength = await probeUpstreamContentLength(descriptor);
+  }
+
+  const ranges = !descriptor.contentLength
+    ? [[0, 0]]
+    : validationProbeRanges(descriptor.contentLength, STREAM_CHUNK_SIZE, STREAM_VALIDATION_PROBE_BYTES);
+
+  for (const [start, end] of ranges) {
+    const upstream = await fetchUpstreamRange(descriptor, start, end, STREAM_VALIDATION_TIMEOUT_MS);
+    const status = upstream.statusCode || 0;
+    discardUpstream(upstream);
+    if (status !== 206 && !(status === 200 && start === 0)) {
+      const error = new Error(`stream validation failed (HTTP ${status}) for bytes ${start}-${end}`);
+      error.code = 'STREAM_VALIDATION_FAILED';
+      throw error;
+    }
+  }
+  return descriptor.contentLength;
+}
+
+async function refreshStreamDescriptor(descriptor) {
+  if (!descriptor?.videoId) return false;
+  if (descriptor.refreshCount >= STREAM_REFRESH_MAX_ATTEMPTS) return false;
+  if (descriptor.refreshPromise) return descriptor.refreshPromise;
+
+  descriptor.refreshCount += 1;
+  descriptor.refreshPromise = (async () => {
+    const requestedClient = descriptor.requestedClient === 'YTMUSIC' ? 'YTMUSIC' : 'MWEB';
+    try {
+      const context = await getSession(descriptor.cookieFile);
+      const { info, format, client } = await resolveFormat(context, descriptor.videoId, requestedClient, {
+        type: 'audio',
+        quality: 'best',
+        format: 'any'
+      }, { forceFresh: descriptor.refreshCount > 1 });
+
+      const nextLength = Number(format.content_length) || 0;
+      if (descriptor.contentLength && nextLength && nextLength !== descriptor.contentLength) {
+        throw new Error(`content length changed (${descriptor.contentLength} -> ${nextLength})`);
+      }
+
+      const payload = {
+        ...infoPayload(info, descriptor.videoId),
+        ...formatPayload(format),
+        client,
+        http_headers: { 'User-Agent': USER_AGENT }
+      };
+      const ttlMs = streamCacheTtlMs(format.url);
+
+      descriptor.url = format.url;
+      descriptor.headers = payload.http_headers;
+      descriptor.contentLength = nextLength || descriptor.contentLength;
+      descriptor.expiresAt = Date.now() + ttlMs;
+
+      const cacheKey = `${cookieFileKey(descriptor.cookieFile)}:${requestedClient}:${descriptor.videoId}`;
+      resolveCache.set(cacheKey, { ...payload, cache_expires_at_ms: Date.now() + ttlMs }, ttlMs);
+      scheduleSaveDiskCache();
+      console.log(`[youtube-bridge] stream refreshed video=${descriptor.videoId} client=${client} itag=${format.itag} attempt=${descriptor.refreshCount}`);
+      return true;
+    } catch (error) {
+      console.warn(`[youtube-bridge] stream refresh failed video=${descriptor.videoId} attempt=${descriptor.refreshCount}: ${error.message}`);
+      return false;
+    } finally {
+      descriptor.refreshPromise = null;
+    }
+  })();
+  return descriptor.refreshPromise;
+}
+
+async function fetchChunkWithRefresh(descriptor, start, end) {
+  let refreshed = false;
+  while (true) {
+    let upstream;
+    try {
+      upstream = await fetchUpstreamRange(descriptor, start, end);
+    } catch (error) {
+      if (!refreshed && await refreshStreamDescriptor(descriptor)) {
+        refreshed = true;
+        continue;
+      }
+      throw error;
+    }
+
+    const status = upstream.statusCode || 0;
+    if (status === 206 && start > 0) {
+      const contentRange = upstream.headers['content-range'] || '';
+      const match = /^bytes\s+(\d+)-/.exec(contentRange);
+      if (match && Number(match[1]) !== start) {
+        discardUpstream(upstream);
+        if (!refreshed && await refreshStreamDescriptor(descriptor)) {
+          refreshed = true;
+          continue;
+        }
+        throw new Error(`Upstream returned wrong range start (${match[1]} != ${start})`);
+      }
+    }
+    if (status === 206 || (status === 200 && start === 0)) return upstream;
+
+    discardUpstream(upstream);
+    if (!refreshed && await refreshStreamDescriptor(descriptor)) {
+      refreshed = true;
+      continue;
+    }
+    throw new Error(`Upstream responded HTTP ${status}`);
+  }
+}
+
 async function pipeUpstreamChunks(descriptor, res, start, end) {
   let position = start;
   while (position <= end && !res.destroyed) {
     const chunkEnd = Math.min(position + STREAM_CHUNK_SIZE - 1, end);
-    const upstream = await fetchUpstreamRange(descriptor, position, chunkEnd);
+    const upstream = await fetchChunkWithRefresh(descriptor, position, chunkEnd);
     const status = upstream.statusCode || 0;
-    if (status !== 206 && status !== 200) {
-      upstream.resume();
-      throw new Error(`Upstream responded HTTP ${status}`);
-    }
     if (status === 200 && position > 0) {
-      upstream.resume();
+      discardUpstream(upstream);
       throw new Error('Upstream ignored the Range header');
     }
 
@@ -997,20 +1177,33 @@ const server = http.createServer(async (req, res) => {
     body.cookie_file = getBotCookieFile(body.bot_id);
     if (req.url === '/resolve') {
       const payload = { ...(await resolveTrack(body)) };
-      if (payload.url) payload.url = proxiedStreamUrl(req, payload);
+      if (payload.url) {
+        payload.url = proxiedStreamUrl(req, payload, {
+          videoId: payload.videoId || payload.id || body.video_id,
+          client: body.client,
+          botId: body.bot_id,
+          cookieFile: body.cookie_file
+        });
+      }
       return json(res, 200, payload);
     }
     if (req.url === '/invalidate') return json(res, 200, invalidateResolution(body));
     if (req.url === '/info') return json(res, 200, await getInfo(body));
     if (req.url === '/playlist') return json(res, 200, await getPlaylist(body));
-    if (req.url === '/search') return json(res, 200, await searchVideos(body));
+    if (req.url === '/search') return json(res, 200, await searchVideos(body, req));
     if (req.url === '/recommendations') return json(res, 200, await getMusicRecommendations(body));
     if (req.url === '/download-plan') {
       const plan = await getDownloadPlan(body);
+      const videoId = body.video_id || extractVideoId(body.url);
       for (const key of ['audio', 'video']) {
         const entry = plan?.[key];
         if (entry?.url) {
-          entry.url = proxiedStreamUrl(req, { ...entry, http_headers: plan.http_headers });
+          entry.url = proxiedStreamUrl(req, { ...entry, http_headers: plan.http_headers }, {
+            videoId,
+            client: body.client,
+            botId: body.bot_id,
+            cookieFile: body.cookie_file
+          });
         }
       }
       return json(res, 200, plan);
