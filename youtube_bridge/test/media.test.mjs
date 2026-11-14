@@ -2,13 +2,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-  formatFromYtDlpUrl,
+  PLAYER_CLIENTS,
+  extractVisitorData,
+  formatFromPlayerJson,
   musicItemPayload,
   normalizeSearchKey,
   pickBestAudioFormat,
+  pickBestAudioFromPlayerJson,
+  pickBestVideoFromPlayerJson,
+  playerInfo,
+  playerRequestBody,
+  playerRequestHeaders,
   streamCacheTtlMs,
-  validationProbeRanges,
-  ytDlpFormatSelector
+  validationProbeRanges
 } from '../media.mjs';
 
 test('normalizes equivalent search queries per mode', () => {
@@ -113,41 +119,131 @@ test('handles tiny and unknown content lengths', () => {
   assert.deepEqual(rangesFor(1024), ['0-0', '1023-1023']);
 });
 
-test('builds the yt-dlp format selector for audio and video', () => {
-  assert.equal(ytDlpFormatSelector(undefined), 'bestaudio/best');
-  assert.equal(ytDlpFormatSelector({ type: 'audio' }), 'bestaudio/best');
-  assert.equal(ytDlpFormatSelector({ type: 'audio', format: 'any' }), 'bestaudio/best');
-  assert.equal(ytDlpFormatSelector({ type: 'audio', format: 'mp4' }), 'bestaudio[ext=m4a]/bestaudio/best');
-  assert.equal(ytDlpFormatSelector({ type: 'video' }), 'bestvideo/best');
-  assert.equal(ytDlpFormatSelector({ type: 'video', format: 'mp4' }), 'bestvideo[ext=mp4]/bestvideo/best');
-});
-
-test('parses a yt-dlp audio URL into a bridge format', () => {
-  const url =
-    'https://rr5---sn-test.googlevideo.com/videoplayback?itag=251&mime=audio%2Fwebm&bitrate=156272&clen=3340840&dur=180';
-  assert.deepEqual(formatFromYtDlpUrl(url), {
-    url,
-    itag: 251,
-    mime_type: 'audio/webm',
-    bitrate: 156272,
-    average_bitrate: 156272,
-    content_length: 3340840,
-    quality: '',
-    quality_label: '',
-    audio_quality: '',
-    audio_sample_rate: 0,
-    audio_channels: 0,
-    has_audio: true,
-    has_video: false
-  });
-});
-
-test('marks yt-dlp video-only URLs as video', () => {
-  const format = formatFromYtDlpUrl(
-    'https://rr5---sn-test.googlevideo.com/videoplayback?itag=401&mime=video%2Fmp4&clen=240334643'
+test('extracts visitor data from the YouTube homepage config', () => {
+  assert.equal(
+    extractVisitorData('ytcfg.set({"VISITOR_DATA":"Cgtabc123%3D%3D","X":"y"})'),
+    'Cgtabc123%3D%3D'
   );
-  assert.equal(format.mime_type, 'video/mp4');
-  assert.equal(format.has_video, true);
-  assert.equal(format.has_audio, false);
-  assert.equal(format.content_length, 240334643);
+  assert.equal(extractVisitorData('no visitor here'), '');
+  assert.equal(extractVisitorData(''), '');
+});
+
+test('builds a clean player request like yt-dlp does', () => {
+  const client = PLAYER_CLIENTS.visionos;
+  const body = playerRequestBody('8f6sRJ2BRtk', client);
+  assert.equal(body.videoId, '8f6sRJ2BRtk');
+  assert.equal(body.context.client.clientName, 'VISIONOS');
+  assert.equal(body.context.client.clientVersion, '1.02');
+  assert.equal(body.context.client.hl, 'en');
+  assert.equal(body.context.client.timeZone, 'UTC');
+  assert.equal(body.context.client.utcOffsetMinutes, 0);
+  assert.equal(body.context.client.userAgent, client.userAgent);
+  assert.equal(body.context.client.configInfo, undefined);
+  assert.equal(body.contentCheckOk, true);
+  assert.equal(body.racyCheckOk, true);
+
+  const headers = playerRequestHeaders(client, 'VISITOR123');
+  assert.equal(headers['x-youtube-client-name'], '101');
+  assert.equal(headers['x-youtube-client-version'], '1.02');
+  assert.equal(headers['x-goog-visitor-id'], 'VISITOR123');
+  assert.equal(headers.origin, 'https://www.youtube.com');
+  assert.equal(headers['user-agent'], client.userAgent);
+
+  const anonymous = playerRequestHeaders(client, '');
+  assert.equal(anonymous['x-goog-visitor-id'], undefined);
+});
+
+test('normalizes player JSON formats into the bridge format shape', () => {
+  const format = formatFromPlayerJson({
+    itag: 251,
+    mimeType: 'audio/webm; codecs="opus"',
+    bitrate: 156272,
+    averageBitrate: 158000,
+    contentLength: '3340840',
+    quality: 'tiny',
+    audioQuality: 'AUDIO_QUALITY_MEDIUM',
+    audioSampleRate: '48000',
+    audioChannels: 2,
+    url: 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=251&clen=3340840'
+  });
+  assert.equal(format.itag, 251);
+  assert.equal(format.mime_type, 'audio/webm; codecs="opus"');
+  assert.equal(format.bitrate, 156272);
+  assert.equal(format.average_bitrate, 158000);
+  assert.equal(format.content_length, 3340840);
+  assert.equal(format.audio_sample_rate, 48000);
+  assert.equal(format.audio_channels, 2);
+  assert.equal(format.has_audio, true);
+  assert.equal(format.has_video, false);
+});
+
+test('derives content length from the URL when the player JSON omits it', () => {
+  const format = formatFromPlayerJson({
+    itag: 140,
+    mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+    url: 'https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&clen=4110525'
+  });
+  assert.equal(format.content_length, 4110525);
+});
+
+test('picks the highest-bitrate audio from a player response', () => {
+  const playerJson = {
+    streamingData: {
+      adaptiveFormats: [
+        { itag: 140, mimeType: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 129000, averageBitrate: 128000, audioQuality: 'AUDIO_QUALITY_MEDIUM', url: 'https://x.test/a?itag=140' },
+        { itag: 251, mimeType: 'audio/webm; codecs="opus"', bitrate: 160000, averageBitrate: 160000, audioQuality: 'AUDIO_QUALITY_MEDIUM', url: 'https://x.test/a?itag=251' },
+        { itag: 250, mimeType: 'audio/webm; codecs="opus"', bitrate: 70000, averageBitrate: 70000, audioQuality: 'AUDIO_QUALITY_LOW', url: 'https://x.test/a?itag=250' }
+      ]
+    }
+  };
+  assert.equal(pickBestAudioFromPlayerJson(playerJson).itag, 251);
+  assert.equal(pickBestAudioFromPlayerJson(playerJson, { mimeIncludes: 'mp4' }).itag, 140);
+  assert.equal(pickBestAudioFromPlayerJson(playerJson, { mimeIncludes: 'any' }).itag, 251);
+});
+
+test('ignores audio formats without a direct URL', () => {
+  const playerJson = {
+    streamingData: {
+      adaptiveFormats: [
+        { itag: 251, mimeType: 'audio/webm', bitrate: 160000, audioQuality: 'AUDIO_QUALITY_MEDIUM', signatureCipher: 's=abc&url=https%3A%2F%2Fx.test%2Fa' }
+      ]
+    }
+  };
+  assert.equal(pickBestAudioFromPlayerJson(playerJson), null);
+});
+
+test('picks the best video-only format and honours the container request', () => {
+  const playerJson = {
+    streamingData: {
+      formats: [
+        { itag: 18, mimeType: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', bitrate: 500000, height: 360, audioQuality: 'AUDIO_QUALITY_LOW', url: 'https://x.test/v?itag=18' }
+      ],
+      adaptiveFormats: [
+        { itag: 137, mimeType: 'video/mp4; codecs="avc1.640028"', bitrate: 4000000, height: 1080, url: 'https://x.test/v?itag=137' },
+        { itag: 401, mimeType: 'video/mp4; codecs="av01.0.12M.08"', bitrate: 3000000, height: 1080, url: 'https://x.test/v?itag=401' },
+        { itag: 248, mimeType: 'video/webm; codecs="vp9"', bitrate: 2500000, height: 1080, url: 'https://x.test/v?itag=248' }
+      ]
+    }
+  };
+  assert.equal(pickBestVideoFromPlayerJson(playerJson, { mimeIncludes: 'mp4' }).itag, 137);
+  assert.equal(pickBestVideoFromPlayerJson(playerJson, { mimeIncludes: 'any' }).itag, 137);
+  assert.equal(pickBestVideoFromPlayerJson(playerJson, { mimeIncludes: 'webm' }).itag, 248);
+});
+
+test('builds basic info from the player JSON', () => {
+  const info = playerInfo({
+    videoDetails: {
+      videoId: '8f6sRJ2BRtk',
+      title: 'Tribo da Periferia - Valores',
+      author: 'Duckjay',
+      lengthSeconds: '180',
+      isLiveContent: false
+    }
+  }, 'ignored');
+  assert.equal(info.basic_info.id, '8f6sRJ2BRtk');
+  assert.equal(info.basic_info.title, 'Tribo da Periferia - Valores');
+  assert.equal(info.basic_info.author, 'Duckjay');
+  assert.equal(info.basic_info.channel.name, 'Duckjay');
+  assert.equal(info.basic_info.duration, 180);
+  assert.equal(info.basic_info.is_live, false);
 });

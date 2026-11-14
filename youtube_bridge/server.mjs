@@ -1,8 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
 import { once } from 'node:events';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import fs from 'node:fs/promises';
 import { statSync } from 'node:fs';
 import path from 'node:path';
@@ -10,13 +8,18 @@ import { URL } from 'node:url';
 import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
 import {
-  formatFromYtDlpUrl,
+  PLAYER_CLIENTS,
+  extractVisitorData,
   musicItemPayload,
   normalizeSearchKey,
   pickBestAudioFormat,
+  pickBestAudioFromPlayerJson,
+  pickBestVideoFromPlayerJson,
+  playerInfo,
+  playerRequestBody,
+  playerRequestHeaders,
   streamCacheTtlMs,
-  validationProbeRanges,
-  ytDlpFormatSelector
+  validationProbeRanges
 } from './media.mjs';
 
 const HOST = process.env.YOUTUBE_BRIDGE_HOST || '127.0.0.1';
@@ -25,10 +28,8 @@ const POT_URL = process.env.POT_PROVIDER_URL || 'http://127.0.0.1:4416/get_pot';
 const BOTS_ROOT = path.resolve(process.env.TTMEDIABOT_BOTS_ROOT || '/bots');
 const USER_AGENT = process.env.YOUTUBE_BRIDGE_USER_AGENT ||
   'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Version/18.5 Mobile/15E148 Safari/604.1';
-const YTDLP_BIN = process.env.YTDLP_BIN || 'yt-dlp';
-const YTDLP_TIMEOUT_MS = Number(process.env.YTDLP_TIMEOUT_MS || 45000);
-const YTDLP_MAX_BUFFER = 4 * 1024 * 1024;
-const execFileAsync = promisify(execFile);
+const PLAYER_VISITOR_TTL_MS = 30 * 60 * 1000;
+const PLAYER_REQUEST_TIMEOUT_MS = Number(process.env.YOUTUBE_BRIDGE_PLAYER_TIMEOUT_MS || 20000);
 
 // YouTube.js 18 requires an evaluator to decipher player signatures/nsig.
 Platform.shim.eval = async (data) => new Function(data.output)();
@@ -412,42 +413,122 @@ function chooseFormatForOptions(info, formatOptions) {
   return pickBestAudioFormat(info, { mimeIncludes }) || info.chooseFormat(formatOptions);
 }
 
-// yt-dlp extracts googlevideo URLs that do not carry the `n`/`pot` query
-// parameters produced by youtubei.js. Those parameters are exactly what makes
-// YouTube answer 403 for every range past the first MiB, so yt-dlp is used as
-// the primary resolver and youtubei.js only as a fallback.
-async function resolveWithYtDlp(videoId, formatOptions) {
-  const startedAt = performance.now();
-  const selector = ytDlpFormatSelector(formatOptions);
-  const { stdout } = await execFileAsync(YTDLP_BIN, [
-    '--ignore-config',
-    '--quiet',
-    '--no-warnings',
-    '--no-playlist',
-    '--js-runtimes', 'node',
-    '-f', selector,
-    '-g',
-    `https://www.youtube.com/watch?v=${videoId}`
-  ], { timeout: YTDLP_TIMEOUT_MS, maxBuffer: YTDLP_MAX_BUFFER });
+// The player API is called directly (instead of going through youtubei.js) so
+// the request context looks exactly like yt-dlp's: a client-only context plus
+// the visitor data in the `X-Goog-Visitor-Id` header. VISIONOS answers with
+// direct googlevideo URLs that carry no `n`/`pot` parameters, which is what
+// lets the stream proxy fetch ranges past the first MiB.
+let playerVisitorCache = { value: '', expiresAt: 0, promise: null };
 
-  const streamUrl = String(stdout || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => /^https?:\/\//i.test(line));
-  if (!streamUrl) throw new Error('yt-dlp returned no stream URL');
-  if (/\.m3u8|\.mpd(\?|$)/i.test(streamUrl)) {
-    throw new Error('yt-dlp returned a manifest instead of a direct media URL');
+async function fetchPlayerVisitorData() {
+  const startedAt = performance.now();
+  const response = await fetch('https://www.youtube.com/', {
+    headers: {
+      'user-agent': PLAYER_CLIENTS.visionos.userAgent,
+      'accept-language': 'en-US,en;q=0.9'
+    },
+    signal: AbortSignal.timeout(PLAYER_REQUEST_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`visitor page HTTP ${response.status}`);
+  const visitorData = extractVisitorData(await response.text());
+  if (!visitorData) throw new Error('visitor data missing from YouTube homepage');
+  console.log(`[youtube-bridge] player visitor refreshed elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+  return visitorData;
+}
+
+async function getPlayerVisitorData({ forceFresh = false } = {}) {
+  const now = Date.now();
+  if (!forceFresh && playerVisitorCache.value && playerVisitorCache.expiresAt > now) {
+    return playerVisitorCache.value;
+  }
+  if (!forceFresh && playerVisitorCache.promise) {
+    return playerVisitorCache.promise;
+  }
+  const promise = fetchPlayerVisitorData()
+    .then((value) => {
+      playerVisitorCache = { value, expiresAt: Date.now() + PLAYER_VISITOR_TTL_MS, promise: null };
+      return value;
+    })
+    .catch((error) => {
+      playerVisitorCache = { value: '', expiresAt: 0, promise: null };
+      throw error;
+    });
+  playerVisitorCache = { ...playerVisitorCache, promise };
+  return promise;
+}
+
+async function requestPlayerJson(videoId, client, visitorData) {
+  const response = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+    method: 'POST',
+    headers: playerRequestHeaders(client, visitorData),
+    body: JSON.stringify(playerRequestBody(videoId, client)),
+    signal: AbortSignal.timeout(PLAYER_REQUEST_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`player API HTTP ${response.status}`);
+  return response.json();
+}
+
+async function resolveWithPlayerApi(videoId, formatOptions, { forceFresh = false } = {}) {
+  const failures = [];
+  const attempts = 2;
+
+  for (const key of Object.keys(PLAYER_CLIENTS)) {
+    const client = PLAYER_CLIENTS[key];
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const attemptStartedAt = performance.now();
+      try {
+        const visitorStartedAt = performance.now();
+        const visitorData = await getPlayerVisitorData({ forceFresh: forceFresh || attempt > 1 });
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=visitor elapsed_ms=${Math.round(performance.now() - visitorStartedAt)}`);
+
+        const playerStartedAt = performance.now();
+        const playerJson = await requestPlayerJson(videoId, client, visitorData);
+        const status = playerJson?.playabilityStatus?.status || 'UNKNOWN';
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=player elapsed_ms=${Math.round(performance.now() - playerStartedAt)} status=${status}`);
+        if (status !== 'OK' || !playerJson?.streamingData) {
+          const reason = playerJson?.playabilityStatus?.reason || '';
+          throw new Error(reason ? `${status}: ${reason}` : `player status ${status}`);
+        }
+
+        const formatStartedAt = performance.now();
+        const format = formatOptions?.type === 'video'
+          ? pickBestVideoFromPlayerJson(playerJson, { mimeIncludes: formatOptions.format })
+          : pickBestAudioFromPlayerJson(playerJson, { mimeIncludes: formatOptions.format });
+        if (!format) throw new Error('no playable format returned');
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=choose-format elapsed_ms=${Math.round(performance.now() - formatStartedAt)} itag=${format.itag} bitrate=${format.average_bitrate || format.bitrate || 0}`);
+
+        const info = playerInfo(playerJson, videoId);
+        const isLive = Boolean(info.basic_info.is_live || info.basic_info.is_live_content);
+        const validateStartedAt = performance.now();
+        const validatedLength = await validateStreamUrl(
+          format.url,
+          { 'User-Agent': client.userAgent },
+          format.content_length,
+          { isLive }
+        );
+        if (validatedLength) format.content_length = validatedLength;
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=validate elapsed_ms=${Math.round(performance.now() - validateStartedAt)}`);
+
+        console.log(`[youtube-bridge] resolved ${videoId} with client=${client.name} itag=${format.itag} elapsed_ms=${Math.round(performance.now() - attemptStartedAt)}`);
+        return { info, format, client: client.name };
+      } catch (error) {
+        const message = error?.message || String(error);
+        failures.push(`${client.name}#${attempt}: ${message}`);
+        console.warn(`[youtube-bridge] ${videoId} client=${client.name} attempt=${attempt}/${attempts} failed: ${message}`);
+        if (error?.code === 'STREAM_VALIDATION_FAILED' && attempt < attempts) {
+          continue;
+        }
+        if (/LOGIN_REQUIRED|UNPLAYABLE/i.test(message) && attempt < attempts) {
+          // A stale visitor data is the usual cause of LOGIN_REQUIRED, so mint
+          // a new one before giving up on this client.
+          continue;
+        }
+        break;
+      }
+    }
   }
 
-  const format = formatFromYtDlpUrl(streamUrl);
-  const headers = { 'User-Agent': USER_AGENT };
-  const validatedLength = await validateStreamUrl(streamUrl, headers, format.content_length);
-  if (validatedLength) format.content_length = validatedLength;
-
-  const duration = Number(new URL(streamUrl).searchParams.get('dur')) || 0;
-  const info = { basic_info: { id: videoId, duration } };
-  console.log(`[youtube-bridge] yt-dlp resolved ${videoId} itag=${format.itag} mime=${format.mime_type} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
-  return { info, format, client: 'YTDLP' };
+  throw new Error(failures.join(' | '));
 }
 
 async function resolveWithInnertube(context, videoId, requestedClient, formatOptions, { forceFresh = false } = {}) {
@@ -529,14 +610,14 @@ async function resolveWithInnertube(context, videoId, requestedClient, formatOpt
 
 async function resolveFormat(context, videoId, requestedClient, formatOptions, options = {}) {
   try {
-    return await resolveWithYtDlp(videoId, formatOptions);
+    return await resolveWithPlayerApi(videoId, formatOptions, options);
   } catch (error) {
     const message = error?.message || String(error);
-    console.warn(`[youtube-bridge] yt-dlp resolve failed for ${videoId}: ${message}`);
+    console.warn(`[youtube-bridge] player API resolve failed for ${videoId}: ${message}`);
     try {
       return await resolveWithInnertube(context, videoId, requestedClient, formatOptions, options);
     } catch (innerError) {
-      throw new Error(`Unable to resolve stream for ${videoId}; YTDLP: ${message} | ${innerError.message}`);
+      throw new Error(`Unable to resolve stream for ${videoId}; PLAYER: ${message} | ${innerError.message}`);
     }
   }
 }

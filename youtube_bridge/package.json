@@ -6,6 +6,6 @@
     "test": "node --test"
   },
   "dependencies": {
-    "youtubei.js": "github:LuanRT/YouTube.js#main"
+    "youtubei.js": "github:LuanRT/YouTube.js#v18.3.0"
   }
 }

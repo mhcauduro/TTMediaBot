@@ -4,6 +4,13 @@ All notable updates to this fork are documented here, in reverse chronological o
 
 ---
 
+## 🔧 Unreleased — Native YouTube Player API Resolver
+
+- Replaced the `yt-dlp` subprocess in the YouTube bridge with a direct call to `/youtubei/v1/player`, using the `VISIONOS` client, a clean client-only context, and the `X-Goog-Visitor-Id` header read from the YouTube homepage config.
+- Kept the `youtubei.js` MWEB + PO-token path only as a final fallback, preserving the existing range validation and chunked stream proxy.
+- Removed `yt-dlp` from `requirements.txt` and dropped the yt-dlp-only helpers and tests.
+- Pinned `youtubei.js` to the `v18.3.0` tag so image rebuilds are reproducible instead of tracking `main`.
+
 ## 🔧 Unreleased — Generic Stream Resolver
 
 - Added an extensible page-to-media resolver registry for the `u` command.
