@@ -8,9 +8,15 @@ import { URL } from 'node:url';
 import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
 import {
+  LOGGED_IN_CLIENTS,
   PLAYER_CLIENTS,
+  appendPoToken,
+  buildSapisidAuthorization,
+  extractSessionIndex,
   extractSignatureTimestamp,
+  extractUserSessionId,
   extractVisitorData,
+  isLoggedInPage,
   musicItemPayload,
   normalizeSearchKey,
   pickBestAudioFormat,
@@ -31,6 +37,11 @@ const USER_AGENT = process.env.YOUTUBE_BRIDGE_USER_AGENT ||
   'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 Version/18.5 Mobile/15E148 Safari/604.1';
 const PLAYER_VISITOR_TTL_MS = 30 * 60 * 1000;
 const PLAYER_REQUEST_TIMEOUT_MS = Number(process.env.YOUTUBE_BRIDGE_PLAYER_TIMEOUT_MS || 20000);
+// The POT provider mints a valid GVS token only part of the time (the BotGuard
+// challenge it fetches from YouTube is inconsistent). A rejected token is
+// detected by the range validation, so mint a fresh one and retry. With the
+// observed hit rate, eight attempts fail less than 1% of the time.
+const LOGGED_IN_TOKEN_ATTEMPTS = Number(process.env.YOUTUBE_BRIDGE_TOKEN_ATTEMPTS || 8);
 
 // YouTube.js 18 requires an evaluator to decipher player signatures/nsig.
 Platform.shim.eval = async (data) => new Function(data.output)();
@@ -280,14 +291,15 @@ async function getSearchSession() {
   return searchSessionPromise;
 }
 
-async function getPoToken(contentBinding, { forceFresh = false } = {}) {
+async function getPoToken(contentBinding, { forceFresh = false, innertubeContext = null } = {}) {
   try {
     const response = await fetch(POT_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         content_binding: contentBinding,
-        ...(forceFresh ? { bypass_cache: true } : {})
+        ...(forceFresh ? { bypass_cache: true } : {}),
+        ...(innertubeContext ? { innertube_context: innertubeContext } : {})
       })
     });
     if (!response.ok) {
@@ -450,8 +462,11 @@ async function fetchPlayerSessionData(cookieFile, videoId) {
   const visitorData = extractVisitorData(html);
   if (!visitorData) throw new Error('visitor data missing from YouTube watch page');
   const signatureTimestamp = extractSignatureTimestamp(html);
-  console.log(`[youtube-bridge] player session refreshed elapsed_ms=${Math.round(performance.now() - startedAt)} sts=${signatureTimestamp}`);
-  return { visitorData, signatureTimestamp };
+  const userSessionId = extractUserSessionId(html);
+  const sessionIndex = extractSessionIndex(html);
+  const loggedIn = isLoggedInPage(html);
+  console.log(`[youtube-bridge] player session refreshed elapsed_ms=${Math.round(performance.now() - startedAt)} sts=${signatureTimestamp} logged_in=${loggedIn} user_session=${Boolean(userSessionId)} session_index=${sessionIndex}`);
+  return { visitorData, signatureTimestamp, userSessionId, sessionIndex, loggedIn, cookieHeader: cookie };
 }
 
 async function getPlayerSessionData(cookieFile, videoId, { forceFresh = false } = {}) {
@@ -478,9 +493,19 @@ async function getPlayerSessionData(cookieFile, videoId, { forceFresh = false } 
 }
 
 async function requestPlayerJson(videoId, client, sessionData) {
+  // Only logged-in clients carry the account session. VISIONOS rejects
+  // authenticated requests, so it stays anonymous.
+  const auth = client.sendCookies
+    ? {
+      cookie: sessionData?.cookieHeader || '',
+      authorization: buildSapisidAuthorization(sessionData?.cookieHeader, sessionData?.userSessionId),
+      sessionIndex: sessionData?.sessionIndex ?? 0,
+      loggedIn: Boolean(sessionData?.loggedIn)
+    }
+    : {};
   const response = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
     method: 'POST',
-    headers: playerRequestHeaders(client, sessionData?.visitorData),
+    headers: playerRequestHeaders(client, sessionData?.visitorData, auth),
     body: JSON.stringify(playerRequestBody(videoId, client, {
       signatureTimestamp: sessionData?.signatureTimestamp
     })),
@@ -496,6 +521,9 @@ async function resolveWithPlayerApi(videoId, formatOptions, { cookieFile = '', f
 
   for (const key of Object.keys(PLAYER_CLIENTS)) {
     const client = PLAYER_CLIENTS[key];
+    // Logged-in clients are handled by resolveWithLoggedInPlayer: without a PO
+    // token their ciphered formats only survive the first byte.
+    if (client.sendCookies) continue;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const attemptStartedAt = performance.now();
       try {
@@ -545,6 +573,122 @@ async function resolveWithPlayerApi(videoId, formatOptions, { cookieFile = '', f
           // a new one before giving up on this client.
           continue;
         }
+        break;
+      }
+    }
+  }
+
+  throw new Error(failures.join(' | '));
+}
+
+// Logged-in resolution path.
+//
+// Since 2026-11-16 the anonymous player API answers
+// `LOGIN_REQUIRED: Sign in to confirm you're not a bot` for every client, and
+// the bot cookies alone are not enough: the request also needs the
+// SAPISIDHASH authorization headers derived from the account session. MWEB is
+// the client that keeps returning classic adaptive formats for a logged-in
+// session; they come as `signatureCipher` and must be deciphered.
+//
+// The deciphered URL still answers 403 for every range past the first MiB
+// unless a GVS PO token bound to the *video id* is appended as `pot`. The POT
+// provider is inconsistent (roughly half of the tokens are rejected), so each
+// validation failure mints a fresh token and retries without asking YouTube
+// for the player JSON again.
+async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = '', forceFresh = false } = {}) {
+  if (!cookieFile) throw new Error('no cookie file');
+  let sessionData = await getPlayerSessionData(cookieFile, videoId, { forceFresh });
+  if (!sessionData?.cookieHeader) throw new Error('YouTube cookies are missing');
+  if (!sessionData?.loggedIn) throw new Error('YouTube cookies are not logged in');
+
+  const context = await getSession(cookieFile);
+  const failures = [];
+
+  for (const clientKey of LOGGED_IN_CLIENTS) {
+    const client = PLAYER_CLIENTS[clientKey];
+    let playerJson = null;
+    let format = null;
+    let baseUrl = '';
+    let refreshPlayer = false;
+    let firstByteFailures = 0;
+
+    for (let attempt = 1; attempt <= LOGGED_IN_TOKEN_ATTEMPTS; attempt++) {
+      const attemptStartedAt = performance.now();
+      try {
+        if (!playerJson || refreshPlayer) {
+          refreshPlayer = false;
+          const playerStartedAt = performance.now();
+          playerJson = await requestPlayerJson(videoId, client, sessionData);
+          const status = playerJson?.playabilityStatus?.status || 'UNKNOWN';
+          console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} mode=logged-in stage=player elapsed_ms=${Math.round(performance.now() - playerStartedAt)} status=${status}`);
+          if (status !== 'OK' || !playerJson?.streamingData) {
+            const reason = playerJson?.playabilityStatus?.reason || '';
+            if (/LOGIN_REQUIRED|UNPLAYABLE/i.test(status) && attempt === 1) {
+              sessionData = await getPlayerSessionData(cookieFile, videoId, { forceFresh: true });
+              continue;
+            }
+            throw new Error(reason ? `${status}: ${reason}` : `player status ${status}`);
+          }
+          format = formatOptions?.type === 'video'
+            ? pickBestVideoFromPlayerJson(playerJson, { mimeIncludes: formatOptions.format, allowCiphered: true })
+            : pickBestAudioFromPlayerJson(playerJson, { mimeIncludes: formatOptions.format, allowCiphered: true });
+          if (!format) throw new Error('no playable format returned');
+          baseUrl = '';
+        }
+
+        if (!baseUrl) {
+          if (format.signature_cipher) {
+            const player = context?.session?.session?.player;
+            if (!player) throw new Error('YouTube player is unavailable');
+            player.po_token = undefined;
+            baseUrl = await player.decipher(undefined, format.signature_cipher, undefined, new Map());
+          } else {
+            baseUrl = format.url || '';
+          }
+          if (!baseUrl) throw new Error('decipher returned an empty stream URL');
+        }
+
+        const poStartedAt = performance.now();
+        const poToken = await getPoToken(videoId, { forceFresh: attempt > 1 });
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} mode=logged-in stage=po-token elapsed_ms=${Math.round(performance.now() - poStartedAt)} available=${Boolean(poToken)} attempt=${attempt}`);
+        const streamUrl = appendPoToken(baseUrl, poToken);
+
+        const validateStartedAt = performance.now();
+        const validatedLength = await validateStreamUrl(
+          streamUrl,
+          { 'User-Agent': client.userAgent },
+          format.content_length,
+          { isLive: Boolean(playerJson?.videoDetails?.isLive || playerJson?.videoDetails?.isLiveContent) }
+        );
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} mode=logged-in stage=validate elapsed_ms=${Math.round(performance.now() - validateStartedAt)}`);
+        if (validatedLength) format.content_length = validatedLength;
+        format.url = streamUrl;
+
+        console.log(`[youtube-bridge] resolved ${videoId} with client=${client.name} mode=logged-in itag=${format.itag} pot_len=${(poToken || '').length} attempt=${attempt} elapsed_ms=${Math.round(performance.now() - attemptStartedAt)}`);
+        return {
+          info: playerInfo(playerJson, videoId),
+          format,
+          client: client.name,
+          userAgent: client.userAgent
+        };
+      } catch (error) {
+        const message = error?.message || String(error);
+        failures.push(`logged-in:${client.name}#${attempt}: ${message}`);
+        console.warn(`[youtube-bridge] ${videoId} client=${client.name} mode=logged-in attempt=${attempt}/${LOGGED_IN_TOKEN_ATTEMPTS} failed: ${message}`);
+        if (error?.code === 'STREAM_VALIDATION_FAILED') {
+          // A rejected first byte means the deciphered URL itself is stale/bad,
+          // so ask YouTube for a fresh player response. A rejection past the
+          // first MiB is the PO-token gate: only the token needs to be fresh.
+          if (/for bytes 0-0\b/.test(message)) {
+            refreshPlayer = true;
+            // Two consecutive first-byte rejections mean this client cannot
+            // serve the video at all (typical for official music videos), so
+            // move on to the next client instead of burning every attempt.
+            if (++firstByteFailures >= 2) break;
+          }
+          continue;
+        }
+        if (/LOGIN_REQUIRED|UNPLAYABLE/i.test(message) && attempt === 1) continue;
         break;
       }
     }
@@ -632,16 +776,31 @@ async function resolveWithInnertube(context, videoId, requestedClient, formatOpt
 
 async function resolveFormat(context, videoId, requestedClient, formatOptions, options = {}) {
   const playerOptions = { ...options, cookieFile: context?.cookieFile || '' };
+  const failures = [];
+
+  if (playerOptions.cookieFile) {
+    try {
+      return await resolveWithLoggedInPlayer(videoId, formatOptions, playerOptions);
+    } catch (error) {
+      const message = error?.message || String(error);
+      failures.push(`LOGGED_IN: ${message}`);
+      console.warn(`[youtube-bridge] logged-in resolve failed for ${videoId}: ${message}`);
+    }
+  }
+
   try {
     return await resolveWithPlayerApi(videoId, formatOptions, playerOptions);
   } catch (error) {
     const message = error?.message || String(error);
+    failures.push(`PLAYER: ${message}`);
     console.warn(`[youtube-bridge] player API resolve failed for ${videoId}: ${message}`);
-    try {
-      return await resolveWithInnertube(context, videoId, requestedClient, formatOptions, options);
-    } catch (innerError) {
-      throw new Error(`Unable to resolve stream for ${videoId}; PLAYER: ${message} | ${innerError.message}`);
-    }
+  }
+
+  try {
+    return await resolveWithInnertube(context, videoId, requestedClient, formatOptions, options);
+  } catch (innerError) {
+    failures.push(innerError.message);
+    throw new Error(`Unable to resolve stream for ${videoId}; ${failures.join(' | ')}`);
   }
 }
 
@@ -695,7 +854,7 @@ function invalidateResolution(body) {
 async function resolveTrackUncached(body, videoId, requestedClient) {
   const context = await getSession(body.cookie_file);
 
-  const { info, format, client } = await resolveFormat(context, videoId, requestedClient, {
+  const { info, format, client, userAgent } = await resolveFormat(context, videoId, requestedClient, {
     type: 'audio',
     quality: 'best',
     format: 'any'
@@ -707,13 +866,33 @@ async function resolveTrackUncached(body, videoId, requestedClient) {
     ...formatPayload(format),
     client,
     format: 'mp3',
-    http_headers: { 'User-Agent': USER_AGENT }
+    http_headers: { 'User-Agent': userAgent || USER_AGENT }
   };
 }
 
 async function getInfo(body) {
   const videoId = body.video_id || extractVideoId(body.url);
   if (!videoId) throw new Error('Invalid YouTube URL or video ID');
+
+  // Metadata needs the same logged-in player request as playback: the plain
+  // cookie-only Innertube call answers `LOGIN_REQUIRED` for everybody now.
+  if (body.cookie_file) {
+    try {
+      const sessionData = await getPlayerSessionData(body.cookie_file, videoId);
+      if (sessionData?.cookieHeader && sessionData?.loggedIn) {
+        const playerJson = await requestPlayerJson(videoId, PLAYER_CLIENTS.mweb, sessionData);
+        const info = playerInfo(playerJson, videoId);
+        return {
+          ...infoPayload(info, videoId),
+          playability_status: playerJson?.playabilityStatus?.status || '',
+          playability_reason: playerJson?.playabilityStatus?.reason || ''
+        };
+      }
+    } catch (error) {
+      console.warn(`[youtube-bridge] logged-in info failed for ${videoId}: ${error.message}`);
+    }
+  }
+
   const context = await getSession(body.cookie_file);
   const client = body.client === 'YTMUSIC' ? 'YTMUSIC' : 'MWEB';
   const poToken = await getPoToken(context.poBinding || videoId);
@@ -975,13 +1154,13 @@ async function getDownloadPlan(body) {
   const requestedClient = body.client === 'YTMUSIC' ? 'YTMUSIC' : 'MWEB';
 
   if (!body.video) {
-    const { format: audio, client } = await resolveFormat(context, videoId, requestedClient, {
+    const { format: audio, client, userAgent } = await resolveFormat(context, videoId, requestedClient, {
       type: 'audio', quality: 'best', format: 'any'
     });
     return {
       audio: formatPayload(audio),
       client,
-      http_headers: { 'User-Agent': USER_AGENT }
+      http_headers: { 'User-Agent': userAgent || USER_AGENT }
     };
   }
 
@@ -1012,7 +1191,7 @@ async function getDownloadPlan(body) {
     video: formatPayload(videoResult.format),
     audio: formatPayload(audioResult.format),
     client: `${videoResult.client}/${audioResult.client}`,
-    http_headers: { 'User-Agent': USER_AGENT }
+    http_headers: { 'User-Agent': videoResult.userAgent || audioResult.userAgent || USER_AGENT }
   };
 }
 
@@ -1181,7 +1360,7 @@ async function refreshStreamDescriptor(descriptor) {
     const requestedClient = descriptor.requestedClient === 'YTMUSIC' ? 'YTMUSIC' : 'MWEB';
     try {
       const context = await getSession(descriptor.cookieFile);
-      const { info, format, client } = await resolveFormat(context, descriptor.videoId, requestedClient, {
+      const { info, format, client, userAgent } = await resolveFormat(context, descriptor.videoId, requestedClient, {
         type: 'audio',
         quality: 'best',
         format: 'any'
@@ -1196,7 +1375,7 @@ async function refreshStreamDescriptor(descriptor) {
         ...infoPayload(info, descriptor.videoId),
         ...formatPayload(format),
         client,
-        http_headers: { 'User-Agent': USER_AGENT }
+        http_headers: { 'User-Agent': userAgent || USER_AGENT }
       };
       const ttlMs = streamCacheTtlMs(format.url);
 

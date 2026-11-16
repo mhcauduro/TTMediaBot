@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 const STREAM_CACHE_FALLBACK_TTL_MS = 5 * 60 * 1000;
 const STREAM_CACHE_MAX_TTL_MS = 60 * 60 * 1000;
 const STREAM_EXPIRY_SAFETY_MS = 2 * 60 * 1000;
@@ -118,8 +120,45 @@ export const PLAYER_CLIENTS = {
       osName: 'visionOS',
       osVersion: '26.5.23O471'
     }
+  },
+  // Logged-in client. Since 2026-11-16 YouTube only answers the player API
+  // with playable formats when the request carries the account session:
+  // cookies alone still yield `LOGIN_REQUIRED`, so the bridge also sends the
+  // SAPISIDHASH authorization headers (see buildSapisidAuthorization). MWEB
+  // replies with `signatureCipher` formats that must be deciphered, and the
+  // media URL only serves ranges past the first MiB when a GVS PO token bound
+  // to the *video id* is appended as `pot`.
+  mweb: {
+    name: 'MWEB',
+    clientId: '2',
+    version: '2.20260708.05.00',
+    userAgent: 'Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)',
+    context: {
+      clientName: 'MWEB',
+      clientVersion: '2.20260708.05.00'
+    },
+    sendCookies: true
+  },
+  // Fallback for videos whose MWEB stream URLs reject every request with 403
+  // (mostly official music videos). WEB_CREATOR serves the same ciphered
+  // formats but from a host that accepts the first byte, so the PO token only
+  // gates the ranges past the first MiB.
+  web_creator: {
+    name: 'WEB_CREATOR',
+    clientId: '62',
+    version: '1.20260708.06.00',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+    context: {
+      clientName: 'WEB_CREATOR',
+      clientVersion: '1.20260708.06.00'
+    },
+    sendCookies: true
   }
 };
+
+// Order matters: MWEB answers for most videos and is preferred, WEB_CREATOR is
+// the fallback for the ones MWEB cannot serve.
+export const LOGGED_IN_CLIENTS = ['mweb', 'web_creator'];
 
 export function extractVisitorData(html) {
   const match = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(String(html || ''));
@@ -132,6 +171,75 @@ export function extractVisitorData(html) {
 export function extractSignatureTimestamp(html) {
   const match = /"STS"\s*:\s*(\d+)/.exec(String(html || ''));
   return match ? Number(match[1]) : 0;
+}
+
+// `DATASYNC_ID` is a `"<channel>||<session>"` pair. The session half is the
+// account session id used by the SAPISIDHASH authorization scheme.
+export function extractUserSessionId(html) {
+  const page = String(html || '');
+  const direct = /"USER_SESSION_ID"\s*:\s*"([^"]+)"/.exec(page);
+  if (direct) return direct[1];
+  const dataSync = /"DATASYNC_ID"\s*:\s*"([^"]+)"/.exec(page);
+  if (!dataSync) return '';
+  const parts = dataSync[1].split('||');
+  return parts.length > 1 ? parts[1] : '';
+}
+
+export function extractSessionIndex(html) {
+  const match = /"SESSION_INDEX"\s*:\s*"?(\d+)"?/.exec(String(html || ''));
+  return match ? Number(match[1]) : 0;
+}
+
+export function isLoggedInPage(html) {
+  return /"LOGGED_IN"\s*:\s*true/.test(String(html || ''));
+}
+
+export function cookieHeaderToMap(cookieHeader) {
+  const map = new Map();
+  for (const part of String(cookieHeader || '').split(/;\s*/)) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) continue;
+    map.set(part.slice(0, separator).trim(), part.slice(separator + 1).trim());
+  }
+  return map;
+}
+
+// SAPISIDHASH is what turns a cookie jar into a genuinely authenticated
+// YouTube session (the same scheme google APIs use). Without it the player API
+// keeps answering `LOGIN_REQUIRED` even when the cookies themselves are valid.
+export function buildSapisidAuthorization(cookieHeader, userSessionId, {
+  origin = 'https://www.youtube.com',
+  nowSeconds = Math.floor(Date.now() / 1000)
+} = {}) {
+  const cookies = cookieHeaderToMap(cookieHeader);
+  const schemes = [
+    ['SAPISIDHASH', cookies.get('SAPISID') || cookies.get('__Secure-3PAPISID')],
+    ['SAPISID1PHASH', cookies.get('__Secure-1PAPISID')],
+    ['SAPISID3PHASH', cookies.get('__Secure-3PAPISID')]
+  ];
+  const authorization = [];
+  for (const [scheme, sapisid] of schemes) {
+    if (!sapisid) continue;
+    const parts = [];
+    if (userSessionId) parts.push(userSessionId);
+    parts.push(String(nowSeconds), sapisid, origin);
+    const hash = createHash('sha1').update(parts.join(' ')).digest('hex');
+    authorization.push(`${scheme} ${nowSeconds}_${hash}${userSessionId ? '_u' : ''}`);
+  }
+  return authorization.join(' ');
+}
+
+// A GVS PO token must be appended to the media URL. Upstream only serves
+// ranges past the first MiB when the `pot` parameter is present and valid.
+export function appendPoToken(streamUrl, token) {
+  if (!streamUrl || !token) return streamUrl;
+  try {
+    const url = new URL(streamUrl);
+    url.searchParams.set('pot', token);
+    return url.toString();
+  } catch {
+    return streamUrl;
+  }
 }
 
 export function playerRequestBody(videoId, client, { signatureTimestamp = 0 } = {}) {
@@ -154,7 +262,12 @@ export function playerRequestBody(videoId, client, { signatureTimestamp = 0 } = 
   };
 }
 
-export function playerRequestHeaders(client, visitorData) {
+export function playerRequestHeaders(client, visitorData, {
+  cookie = '',
+  authorization = '',
+  sessionIndex = 0,
+  loggedIn = false
+} = {}) {
   const headers = {
     'content-type': 'application/json',
     'x-youtube-client-name': client.clientId,
@@ -169,6 +282,13 @@ export function playerRequestHeaders(client, visitorData) {
     'sec-fetch-mode': 'navigate'
   };
   if (visitorData) headers['x-goog-visitor-id'] = visitorData;
+  if (cookie) headers.cookie = cookie;
+  if (authorization) {
+    headers.authorization = authorization;
+    headers['x-origin'] = 'https://www.youtube.com';
+    headers['x-goog-authuser'] = String(sessionIndex ?? 0);
+    if (loggedIn) headers['x-youtube-bootstrap-logged-in'] = 'true';
+  }
   return headers;
 }
 
@@ -204,6 +324,7 @@ export function formatFromPlayerJson(raw) {
     width: Number(raw?.width) || 0,
     height: Number(raw?.height) || 0,
     fps: Number(raw?.fps) || 0,
+    signature_cipher: String(raw?.signatureCipher || raw?.cipher || ''),
     has_audio: hasAudioTrack,
     has_video: isVideoMime
   };
@@ -216,8 +337,10 @@ export function playerFormats(playerJson) {
   return [...adaptive, ...progressive].map(formatFromPlayerJson);
 }
 
-export function pickBestAudioFromPlayerJson(playerJson, { mimeIncludes = '' } = {}) {
-  const candidates = playerFormats(playerJson).filter((format) => format.has_audio && !format.has_video && format.url);
+export function pickBestAudioFromPlayerJson(playerJson, { mimeIncludes = '', allowCiphered = false } = {}) {
+  const candidates = playerFormats(playerJson)
+    .filter((format) => format.has_audio && !format.has_video)
+    .filter((format) => format.url || (allowCiphered && format.signature_cipher));
   if (!candidates.length) return null;
 
   const wanted = String(mimeIncludes || '').toLowerCase();
@@ -238,8 +361,10 @@ export function videoFormatScore(format) {
   return height * 1e9 + bitrate * 1e3 + mp4Bonus;
 }
 
-export function pickBestVideoFromPlayerJson(playerJson, { mimeIncludes = '' } = {}) {
-  const all = playerFormats(playerJson).filter((format) => format.has_video && format.url);
+export function pickBestVideoFromPlayerJson(playerJson, { mimeIncludes = '', allowCiphered = false } = {}) {
+  const all = playerFormats(playerJson)
+    .filter((format) => format.has_video)
+    .filter((format) => format.url || (allowCiphered && format.signature_cipher));
   if (!all.length) return null;
   // Keep video-only formats so the caller can mux them with the best audio.
   const videoOnly = all.filter((format) => !format.has_audio);

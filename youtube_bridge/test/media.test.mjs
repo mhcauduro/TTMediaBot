@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import {
+  LOGGED_IN_CLIENTS,
   PLAYER_CLIENTS,
+  appendPoToken,
+  buildSapisidAuthorization,
+  extractSessionIndex,
   extractSignatureTimestamp,
+  extractUserSessionId,
   extractVisitorData,
+  isLoggedInPage,
   formatFromPlayerJson,
   musicItemPayload,
   normalizeSearchKey,
@@ -258,4 +265,123 @@ test('builds basic info from the player JSON', () => {
   assert.equal(info.basic_info.channel.name, 'Duckjay');
   assert.equal(info.basic_info.duration, 180);
   assert.equal(info.basic_info.is_live, false);
+});
+
+test('extracts the account session id from the watch page', () => {
+  assert.equal(
+    extractUserSessionId('ytcfg.set({"DATASYNC_ID":"abcd||efgh123","X":1})'),
+    'efgh123'
+  );
+  assert.equal(
+    extractUserSessionId('ytcfg.set({"USER_SESSION_ID":"direct-session"})'),
+    'direct-session'
+  );
+  assert.equal(extractUserSessionId('ytcfg.set({"DATASYNC_ID":"nosession"})'), '');
+  assert.equal(extractUserSessionId(''), '');
+});
+
+test('extracts the session index and logged-in flag', () => {
+  assert.equal(extractSessionIndex('ytcfg.set({"SESSION_INDEX":2})'), 2);
+  assert.equal(extractSessionIndex('ytcfg.set({"SESSION_INDEX":"3"})'), 3);
+  assert.equal(extractSessionIndex('nothing'), 0);
+
+  assert.equal(isLoggedInPage('ytcfg.set({"LOGGED_IN":true})'), true);
+  assert.equal(isLoggedInPage('ytcfg.set({"LOGGED_IN":false})'), false);
+  assert.equal(isLoggedInPage(''), false);
+});
+
+test('builds SAPISIDHASH authorization from the cookies', () => {
+  const nowSeconds = 1_800_000_000;
+  const cookieHeader = [
+    'VISITOR_INFO1_LIVE=abc',
+    '__Secure-3PAPISID=papisid3',
+    '__Secure-1PAPISID=papisid1'
+  ].join('; ');
+  const authorization = buildSapisidAuthorization(cookieHeader, 'session-1', { nowSeconds });
+  const sapisid3 = createHash('sha1')
+    .update(`session-1 ${nowSeconds} papisid3 https://www.youtube.com`)
+    .digest('hex');
+  const sapisid1 = createHash('sha1')
+    .update(`session-1 ${nowSeconds} papisid1 https://www.youtube.com`)
+    .digest('hex');
+
+  assert.equal(
+    authorization,
+    `SAPISIDHASH ${nowSeconds}_${sapisid3}_u SAPISID1PHASH ${nowSeconds}_${sapisid1}_u SAPISID3PHASH ${nowSeconds}_${sapisid3}_u`
+  );
+  assert.equal(buildSapisidAuthorization('', 'session-1', { nowSeconds }), '');
+});
+
+test('sends the account session only to clients that support it', () => {
+  const headers = playerRequestHeaders(PLAYER_CLIENTS.mweb, 'VISITOR123', {
+    cookie: 'SAPISID=x',
+    authorization: 'SAPISIDHASH 1_abc_u',
+    sessionIndex: 2,
+    loggedIn: true
+  });
+  assert.equal(headers.cookie, 'SAPISID=x');
+  assert.equal(headers.authorization, 'SAPISIDHASH 1_abc_u');
+  assert.equal(headers['x-goog-authuser'], '2');
+  assert.equal(headers['x-youtube-bootstrap-logged-in'], 'true');
+  assert.equal(headers['x-origin'], 'https://www.youtube.com');
+});
+
+test('appends the PO token without dropping existing query parameters', () => {
+  const url = appendPoToken('https://rr1---sn-test.googlevideo.com/videoplayback?itag=251&n=abc', 'TOKEN');
+  const parsed = new URL(url);
+  assert.equal(parsed.searchParams.get('itag'), '251');
+  assert.equal(parsed.searchParams.get('n'), 'abc');
+  assert.equal(parsed.searchParams.get('pot'), 'TOKEN');
+  assert.equal(appendPoToken('https://x.test/a', ''), 'https://x.test/a');
+  assert.equal(appendPoToken('', 'TOKEN'), '');
+});
+
+test('selects ciphered formats only when explicitly allowed', () => {
+  const playerJson = {
+    streamingData: {
+      adaptiveFormats: [
+        {
+          itag: 251,
+          mimeType: 'audio/webm; codecs="opus"',
+          bitrate: 160000,
+          averageBitrate: 160000,
+          signatureCipher: 's=abc&sp=sig&url=https%3A%2F%2Fx.test%2Fa%3Fitag%3D251'
+        }
+      ]
+    }
+  };
+  assert.equal(pickBestAudioFromPlayerJson(playerJson), null);
+  const cipher = pickBestAudioFromPlayerJson(playerJson, { allowCiphered: true });
+  assert.equal(cipher.itag, 251);
+  assert.match(cipher.signature_cipher, /^s=abc/);
+  assert.equal(cipher.url, '');
+});
+
+test('selects ciphered video formats only when explicitly allowed', () => {
+  const playerJson = {
+    streamingData: {
+      adaptiveFormats: [
+        {
+          itag: 137,
+          mimeType: 'video/mp4; codecs="avc1.640028"',
+          bitrate: 4000000,
+          height: 1080,
+          signatureCipher: 's=abc&url=https%3A%2F%2Fx.test%2Fv%3Fitag%3D137'
+        }
+      ]
+    }
+  };
+  assert.equal(pickBestVideoFromPlayerJson(playerJson), null);
+  assert.equal(pickBestVideoFromPlayerJson(playerJson, { allowCiphered: true }).itag, 137);
+});
+
+test('tries MWEB first and falls back to WEB_CREATOR for logged-in playback', () => {
+  assert.deepEqual(LOGGED_IN_CLIENTS, ['mweb', 'web_creator']);
+  for (const key of LOGGED_IN_CLIENTS) {
+    assert.equal(PLAYER_CLIENTS[key].sendCookies, true);
+    assert.equal(PLAYER_CLIENTS[key].context.clientName, PLAYER_CLIENTS[key].name);
+    assert.ok(PLAYER_CLIENTS[key].userAgent);
+  }
+  // The anonymous VISIONOS client must never receive the account session.
+  assert.equal(PLAYER_CLIENTS.visionos.sendCookies, undefined);
 });
