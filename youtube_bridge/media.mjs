@@ -96,12 +96,14 @@ export function validationProbeRanges(contentLength, chunkSize, probeBytes) {
 // `n`/`pot` query parameters. Those parameters are exactly what makes YouTube
 // answer 403 for every range past the first MiB, so the bridge resolves streams
 // with this client instead of the web/MWEB ones. The values mirror what yt-dlp
-// uses: a clean client-only context (no browser/config noise) plus the visitor
-// data sent as the `X-Goog-Visitor-Id` header.
+// uses: a clean client-only context plus the visitor data taken from a real
+// `/watch` page load (`X-Goog-Visitor-Id`). A homepage visitor is not accepted
+// since 2026-11-16 and yields `LOGIN_REQUIRED: Sign in to confirm you're not a bot`.
 //
 // VISIONOS is the only tested client that survives the full range probe. Others
 // that also answer without `n` (ANDROID_VR, TV_SAMSUNG) still return 403 past
-// ~1 MiB from this host, so they are intentionally not used.
+// ~1 MiB from this host, or only expose SABR/URL-less formats, so they are
+// intentionally not used.
 export const PLAYER_CLIENTS = {
   visionos: {
     name: 'VISIONOS',
@@ -124,7 +126,17 @@ export function extractVisitorData(html) {
   return match ? match[1] : '';
 }
 
-export function playerRequestBody(videoId, client) {
+// `STS` is the YouTube player signature timestamp. yt-dlp sends it inside
+// `playbackContext.contentPlaybackContext` for every player request; the player
+// API accepts requests without it, but sending it keeps us identical to yt-dlp.
+export function extractSignatureTimestamp(html) {
+  const match = /"STS"\s*:\s*(\d+)/.exec(String(html || ''));
+  return match ? Number(match[1]) : 0;
+}
+
+export function playerRequestBody(videoId, client, { signatureTimestamp = 0 } = {}) {
+  const contentPlaybackContext = { html5Preference: 'HTML5_PREF_WANTS' };
+  if (signatureTimestamp) contentPlaybackContext.signatureTimestamp = signatureTimestamp;
   return {
     context: {
       client: {
@@ -136,9 +148,7 @@ export function playerRequestBody(videoId, client) {
       }
     },
     videoId,
-    playbackContext: {
-      contentPlaybackContext: { html5Preference: 'HTML5_PREF_WANTS' }
-    },
+    playbackContext: { contentPlaybackContext },
     contentCheckOk: true,
     racyCheckOk: true
   };
@@ -150,7 +160,13 @@ export function playerRequestHeaders(client, visitorData) {
     'x-youtube-client-name': client.clientId,
     'x-youtube-client-version': client.version,
     origin: 'https://www.youtube.com',
-    'user-agent': client.userAgent
+    'user-agent': client.userAgent,
+    // yt-dlp sends its normal navigation headers on API calls too. YouTube uses
+    // them as part of the bot check, so keep the player request indistinguishable
+    // from a page-driven request.
+    accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'accept-language': 'en-us,en;q=0.5',
+    'sec-fetch-mode': 'navigate'
   };
   if (visitorData) headers['x-goog-visitor-id'] = visitorData;
   return headers;

@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   PLAYER_CLIENTS,
+  extractSignatureTimestamp,
   extractVisitorData,
   formatFromPlayerJson,
   musicItemPayload,
@@ -128,6 +129,12 @@ test('extracts visitor data from the YouTube homepage config', () => {
   assert.equal(extractVisitorData(''), '');
 });
 
+test('extracts the player signature timestamp from the watch page', () => {
+  assert.equal(extractSignatureTimestamp('ytcfg.set({"STS":20767,"VISITOR_DATA":"x"})'), 20767);
+  assert.equal(extractSignatureTimestamp('no sts here'), 0);
+  assert.equal(extractSignatureTimestamp(''), 0);
+});
+
 test('builds a clean player request like yt-dlp does', () => {
   const client = PLAYER_CLIENTS.visionos;
   const body = playerRequestBody('8f6sRJ2BRtk', client);
@@ -141,6 +148,10 @@ test('builds a clean player request like yt-dlp does', () => {
   assert.equal(body.context.client.configInfo, undefined);
   assert.equal(body.contentCheckOk, true);
   assert.equal(body.racyCheckOk, true);
+  assert.equal(body.playbackContext.contentPlaybackContext.signatureTimestamp, undefined);
+
+  const withSts = playerRequestBody('8f6sRJ2BRtk', client, { signatureTimestamp: 20767 });
+  assert.equal(withSts.playbackContext.contentPlaybackContext.signatureTimestamp, 20767);
 
   const headers = playerRequestHeaders(client, 'VISITOR123');
   assert.equal(headers['x-youtube-client-name'], '101');
@@ -148,6 +159,7 @@ test('builds a clean player request like yt-dlp does', () => {
   assert.equal(headers['x-goog-visitor-id'], 'VISITOR123');
   assert.equal(headers.origin, 'https://www.youtube.com');
   assert.equal(headers['user-agent'], client.userAgent);
+  assert.equal(headers['sec-fetch-mode'], 'navigate');
 
   const anonymous = playerRequestHeaders(client, '');
   assert.equal(anonymous['x-goog-visitor-id'], undefined);

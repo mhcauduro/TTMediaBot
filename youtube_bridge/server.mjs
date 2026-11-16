@@ -9,6 +9,7 @@ import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
 import {
   PLAYER_CLIENTS,
+  extractSignatureTimestamp,
   extractVisitorData,
   musicItemPayload,
   normalizeSearchKey,
@@ -249,7 +250,7 @@ async function getSession(cookieFile) {
     // not to the video id. A token minted for the video id is rejected by
     // googlevideo with HTTP 403 even on the very first byte.
     const poBinding = session.session?.context?.client?.visitorData || undefined;
-    return { session, poBinding };
+    return { session, poBinding, cookieFile };
   })().catch((error) => {
     sessionCache.delete(key);
     throw error;
@@ -418,57 +419,78 @@ function chooseFormatForOptions(info, formatOptions) {
 // the visitor data in the `X-Goog-Visitor-Id` header. VISIONOS answers with
 // direct googlevideo URLs that carry no `n`/`pot` parameters, which is what
 // lets the stream proxy fetch ranges past the first MiB.
-let playerVisitorCache = { value: '', expiresAt: 0, promise: null };
+//
+// Since 2026-11-16 a visitor minted by the homepage is rejected with
+// `LOGIN_REQUIRED: Sign in to confirm you're not a bot`. Mirror yt-dlp instead:
+// load the watch page (`has_verified=1`) with the bot cookies and reuse its
+// VISITOR_DATA plus its player signature timestamp (STS) for every video.
+const PLAYER_PAGE_USER_AGENT = process.env.YOUTUBE_BRIDGE_PAGE_USER_AGENT ||
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36';
 
-async function fetchPlayerVisitorData() {
+const playerSessionCache = new Map();
+
+async function fetchPlayerSessionData(cookieFile, videoId) {
   const startedAt = performance.now();
-  const response = await fetch('https://www.youtube.com/', {
+  const cookie = await netscapeCookiesToHeader(cookieFile);
+  const target = videoId
+    ? `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`
+    : 'https://www.youtube.com/';
+  const response = await fetch(target, {
     headers: {
-      'user-agent': PLAYER_CLIENTS.visionos.userAgent,
-      'accept-language': 'en-US,en;q=0.9'
+      'user-agent': PLAYER_PAGE_USER_AGENT,
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-us,en;q=0.5',
+      'sec-fetch-mode': 'navigate',
+      ...(cookie ? { cookie } : {})
     },
     signal: AbortSignal.timeout(PLAYER_REQUEST_TIMEOUT_MS)
   });
-  if (!response.ok) throw new Error(`visitor page HTTP ${response.status}`);
-  const visitorData = extractVisitorData(await response.text());
-  if (!visitorData) throw new Error('visitor data missing from YouTube homepage');
-  console.log(`[youtube-bridge] player visitor refreshed elapsed_ms=${Math.round(performance.now() - startedAt)}`);
-  return visitorData;
+  if (!response.ok) throw new Error(`player session page HTTP ${response.status}`);
+  const html = await response.text();
+  const visitorData = extractVisitorData(html);
+  if (!visitorData) throw new Error('visitor data missing from YouTube watch page');
+  const signatureTimestamp = extractSignatureTimestamp(html);
+  console.log(`[youtube-bridge] player session refreshed elapsed_ms=${Math.round(performance.now() - startedAt)} sts=${signatureTimestamp}`);
+  return { visitorData, signatureTimestamp };
 }
 
-async function getPlayerVisitorData({ forceFresh = false } = {}) {
+async function getPlayerSessionData(cookieFile, videoId, { forceFresh = false } = {}) {
+  const key = cookieFileKey(cookieFile);
   const now = Date.now();
-  if (!forceFresh && playerVisitorCache.value && playerVisitorCache.expiresAt > now) {
-    return playerVisitorCache.value;
-  }
-  if (!forceFresh && playerVisitorCache.promise) {
-    return playerVisitorCache.promise;
-  }
-  const promise = fetchPlayerVisitorData()
+  const cached = playerSessionCache.get(key);
+  if (!forceFresh && cached?.value && cached.expiresAt > now) return cached.value;
+  if (!forceFresh && cached?.promise) return cached.promise;
+
+  const promise = fetchPlayerSessionData(cookieFile, videoId)
     .then((value) => {
-      playerVisitorCache = { value, expiresAt: Date.now() + PLAYER_VISITOR_TTL_MS, promise: null };
+      playerSessionCache.set(key, { value, expiresAt: Date.now() + PLAYER_VISITOR_TTL_MS, promise: null });
       return value;
     })
     .catch((error) => {
-      playerVisitorCache = { value: '', expiresAt: 0, promise: null };
+      playerSessionCache.set(key, { value: null, expiresAt: 0, promise: null });
       throw error;
     });
-  playerVisitorCache = { ...playerVisitorCache, promise };
+  playerSessionCache.set(key, { value: null, expiresAt: 0, promise });
+  while (playerSessionCache.size > SESSION_CACHE_MAX_ENTRIES) {
+    playerSessionCache.delete(playerSessionCache.keys().next().value);
+  }
   return promise;
 }
 
-async function requestPlayerJson(videoId, client, visitorData) {
+async function requestPlayerJson(videoId, client, sessionData) {
   const response = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
     method: 'POST',
-    headers: playerRequestHeaders(client, visitorData),
-    body: JSON.stringify(playerRequestBody(videoId, client)),
+    headers: playerRequestHeaders(client, sessionData?.visitorData),
+    body: JSON.stringify(playerRequestBody(videoId, client, {
+      signatureTimestamp: sessionData?.signatureTimestamp
+    })),
     signal: AbortSignal.timeout(PLAYER_REQUEST_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`player API HTTP ${response.status}`);
   return response.json();
 }
 
-async function resolveWithPlayerApi(videoId, formatOptions, { forceFresh = false } = {}) {
+async function resolveWithPlayerApi(videoId, formatOptions, { cookieFile = '', forceFresh = false } = {}) {
   const failures = [];
   const attempts = 2;
 
@@ -477,12 +499,12 @@ async function resolveWithPlayerApi(videoId, formatOptions, { forceFresh = false
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const attemptStartedAt = performance.now();
       try {
-        const visitorStartedAt = performance.now();
-        const visitorData = await getPlayerVisitorData({ forceFresh: forceFresh || attempt > 1 });
-        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=visitor elapsed_ms=${Math.round(performance.now() - visitorStartedAt)}`);
+        const sessionStartedAt = performance.now();
+        const sessionData = await getPlayerSessionData(cookieFile, videoId, { forceFresh: forceFresh || attempt > 1 });
+        console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=visitor elapsed_ms=${Math.round(performance.now() - sessionStartedAt)}`);
 
         const playerStartedAt = performance.now();
-        const playerJson = await requestPlayerJson(videoId, client, visitorData);
+        const playerJson = await requestPlayerJson(videoId, client, sessionData);
         const status = playerJson?.playabilityStatus?.status || 'UNKNOWN';
         console.log(`[youtube-bridge-timing] video=${videoId} client=${client.name} stage=player elapsed_ms=${Math.round(performance.now() - playerStartedAt)} status=${status}`);
         if (status !== 'OK' || !playerJson?.streamingData) {
@@ -609,8 +631,9 @@ async function resolveWithInnertube(context, videoId, requestedClient, formatOpt
 }
 
 async function resolveFormat(context, videoId, requestedClient, formatOptions, options = {}) {
+  const playerOptions = { ...options, cookieFile: context?.cookieFile || '' };
   try {
-    return await resolveWithPlayerApi(videoId, formatOptions, options);
+    return await resolveWithPlayerApi(videoId, formatOptions, playerOptions);
   } catch (error) {
     const message = error?.message || String(error);
     console.warn(`[youtube-bridge] player API resolve failed for ${videoId}: ${message}`);
