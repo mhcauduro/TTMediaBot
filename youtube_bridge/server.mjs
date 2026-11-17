@@ -1503,7 +1503,12 @@ async function handleStreamRequest(req, res, id) {
     await pipeUpstreamChunks(descriptor, res, start, end);
     res.end();
   } catch (error) {
-    console.warn(`[youtube-bridge] stream ${id} failed: ${error.message}`);
+    // mpv/ffmpeg seek and close connections all the time; that aborts the
+    // upstream request and is normal playback behaviour, not a failure.
+    const clientGone = res.destroyed
+      || ['ECONNRESET', 'EPIPE', 'ABORT_ERR'].includes(error?.code)
+      || /aborted|reset by peer|broken pipe/i.test(error?.message || '');
+    if (!clientGone) console.warn(`[youtube-bridge] stream ${id} failed: ${error.message}`);
     if (!res.headersSent) json(res, 502, { error: error.message });
     else res.destroy(error);
   }
