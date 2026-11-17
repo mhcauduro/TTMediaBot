@@ -597,7 +597,7 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
           baseUrl = format.url || '';
         }
         if (!baseUrl) throw new Error('decipher returned an empty stream URL');
-        found.push({ client, playerJson, format, baseUrl, firstByteFailures: 0 });
+        found.push({ client, playerJson, format, baseUrl });
       } catch (error) {
         failures.push(`${client.name}: ${error?.message || String(error)}`);
       }
@@ -617,7 +617,7 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
     playerJson?.videoDetails?.isLive || playerJson?.videoDetails?.isLiveContent
   ));
 
-  for (let round = 1; round <= LOGGED_IN_TOKEN_ATTEMPTS && candidates.length; round++) {
+  for (let round = 1; round <= LOGGED_IN_TOKEN_ATTEMPTS; round++) {
     const roundStartedAt = performance.now();
     const poToken = await takeToken();
     if (!poToken) throw new Error(`POT provider returned no token; ${failures.join(' | ')}`);
@@ -657,11 +657,12 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
       const message = error?.message || String(error);
       failures.push(`logged-in:${candidate.client.name}#${round}: ${message}`);
       console.warn(`[youtube-bridge] ${videoId} client=${candidate.client.name} mode=logged-in round=${round}/${LOGGED_IN_TOKEN_ATTEMPTS} failed: ${message}`);
-      // A rejected first byte is the client refusing this video (typical for
-      // official music videos), not the token: drop it after a second try.
-      if (/for bytes 0-0\b/.test(message)) candidate.firstByteFailures += 1;
     }
-    candidates = candidates.filter((candidate) => candidate.firstByteFailures < 2);
+    // Never drop a client just because `bytes=0-0` was rejected: an invalid PO
+    // token also rejects the first byte, and the provider hands out a bad token
+    // often enough that two in a row are common. The rounds below mint a fresh
+    // token each time, so a client that truly cannot serve the video simply
+    // keeps failing while a working one wins the round.
   }
 
   throw new Error(failures.join(' | '));
