@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import {
-  DEVICE_FALLBACK_CLIENTS,
+  DEVICE_CLIENTS,
   LOGGED_IN_CLIENTS,
   PLAYER_CLIENTS,
   appendPoToken,
@@ -376,16 +376,17 @@ test('selects ciphered video formats only when explicitly allowed', () => {
   assert.equal(pickBestVideoFromPlayerJson(playerJson, { allowCiphered: true }).itag, 137);
 });
 
-test('tries MWEB first and falls back to WEB_CREATOR for logged-in playback', () => {
+test('uses the cookie-only device client first and MWEB/WEB_CREATOR for the account path', () => {
   assert.deepEqual(LOGGED_IN_CLIENTS, ['mweb', 'web_creator']);
   for (const key of LOGGED_IN_CLIENTS) {
     assert.equal(PLAYER_CLIENTS[key].sendCookies, true);
+    assert.notEqual(PLAYER_CLIENTS[key].sendAuth, false);
     assert.equal(PLAYER_CLIENTS[key].context.clientName, PLAYER_CLIENTS[key].name);
     assert.ok(PLAYER_CLIENTS[key].userAgent);
   }
-  // The device fallback still carries the account cookies, but YouTube rejects
-  // SAPISIDHASH on device clients and their URLs need no PO token.
-  assert.deepEqual(DEVICE_FALLBACK_CLIENTS, ['visionos']);
+  // The device client still carries the cookies, but YouTube rejects
+  // SAPISIDHASH on it and its URLs need no PO token.
+  assert.deepEqual(DEVICE_CLIENTS, ['visionos']);
   const device = PLAYER_CLIENTS.visionos;
   assert.equal(device.sendCookies, true);
   assert.equal(device.sendAuth, false);

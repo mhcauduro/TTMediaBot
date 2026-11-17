@@ -96,17 +96,19 @@ export function validationProbeRanges(contentLength, chunkSize, probeBytes) {
 
 // Player clients used for playback.
 //
-// MWEB/WEB_CREATOR are the signed-in clients: they are called with the bot
-// cookies plus the SAPISIDHASH authorization headers (see
-// buildSapisidAuthorization). They reply with `signatureCipher` formats that
-// must be deciphered, and the media URL only serves ranges past the first MiB
-// when a GVS PO token bound to the *video id* is appended as `pot`.
+// VISIONOS is the primary, cookie-only client: a single request with the bot
+// cookie jar returns direct googlevideo URLs that need no decipher and no PO
+// token (`needsPoToken: false`). YouTube refuses SAPISIDHASH on device clients
+// (`sendAuth: false`), so this path keeps working even with an expired account
+// session. The test matrix showed it answers every regular video measured,
+// including 16K/HDR uploads.
 //
-// VISIONOS is a device client used only as a fallback: some videos (long HDR
-// test clips, for instance) are rejected by the web clients but served to this
-// one. It still sends the account cookies, but YouTube refuses SAPISIDHASH for
-// device clients (`sendAuth: false`), and its direct googlevideo URLs already
-// work past the first MiB without a PO token (`needsPoToken: false`).
+// MWEB/WEB_CREATOR are the account clients, used only when the device client
+// refuses a video. They are called with the cookies plus the SAPISIDHASH
+// authorization headers (see buildSapisidAuthorization). They reply with
+// `signatureCipher` formats that must be deciphered, and the media URL only
+// serves ranges past the first MiB when a GVS PO token bound to the *video id*
+// is appended as `pot`.
 export const PLAYER_CLIENTS = {
   mweb: {
     name: 'MWEB',
@@ -134,8 +136,8 @@ export const PLAYER_CLIENTS = {
     },
     sendCookies: true
   },
-  // Device fallback. Keep it last: it is only queried when both signed-in web
-  // clients fail, so the normal path pays nothing for it.
+  // Cookie-only device client: first in line, because it needs neither the
+  // account authorization nor a PO token.
   visionos: {
     name: 'VISIONOS',
     clientId: '101',
@@ -156,11 +158,11 @@ export const PLAYER_CLIENTS = {
 };
 
 // Order matters: MWEB answers for most videos and is preferred, WEB_CREATOR is
-// the fallback for the ones MWEB cannot serve.
+// the fallback for the ones MWEB cannot serve. Both are account clients.
 export const LOGGED_IN_CLIENTS = ['mweb', 'web_creator'];
 
-// Device clients used only after every signed-in client failed.
-export const DEVICE_FALLBACK_CLIENTS = ['visionos'];
+// Cookie-only device clients, tried before the account path.
+export const DEVICE_CLIENTS = ['visionos'];
 
 export function extractVisitorData(html) {
   const match = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(String(html || ''));
