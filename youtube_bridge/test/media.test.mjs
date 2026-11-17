@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import {
+  DEVICE_FALLBACK_CLIENTS,
   LOGGED_IN_CLIENTS,
   PLAYER_CLIENTS,
   appendPoToken,
@@ -382,7 +383,12 @@ test('tries MWEB first and falls back to WEB_CREATOR for logged-in playback', ()
     assert.equal(PLAYER_CLIENTS[key].context.clientName, PLAYER_CLIENTS[key].name);
     assert.ok(PLAYER_CLIENTS[key].userAgent);
   }
-  // There is no anonymous client left: only logged-in clients are allowed.
-  assert.equal(PLAYER_CLIENTS.visionos, undefined);
-  assert.deepEqual(Object.keys(PLAYER_CLIENTS).sort(), ['mweb', 'web_creator']);
+  // The device fallback still carries the account cookies, but YouTube rejects
+  // SAPISIDHASH on device clients and their URLs need no PO token.
+  assert.deepEqual(DEVICE_FALLBACK_CLIENTS, ['visionos']);
+  const device = PLAYER_CLIENTS.visionos;
+  assert.equal(device.sendCookies, true);
+  assert.equal(device.sendAuth, false);
+  assert.equal(device.needsPoToken, false);
+  assert.deepEqual(Object.keys(PLAYER_CLIENTS).sort(), ['mweb', 'visionos', 'web_creator']);
 });

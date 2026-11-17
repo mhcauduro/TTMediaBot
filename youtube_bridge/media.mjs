@@ -94,13 +94,19 @@ export function validationProbeRanges(contentLength, chunkSize, probeBytes) {
   ];
 }
 
-// Player clients used for signed-in playback. Every client here is called with
-// the bot cookies plus the SAPISIDHASH authorization headers (see
-// buildSapisidAuthorization); there is no anonymous client left on purpose.
+// Player clients used for playback.
 //
-// MWEB replies with `signatureCipher` formats that must be deciphered, and the
-// media URL only serves ranges past the first MiB when a GVS PO token bound to
-// the *video id* is appended as `pot`.
+// MWEB/WEB_CREATOR are the signed-in clients: they are called with the bot
+// cookies plus the SAPISIDHASH authorization headers (see
+// buildSapisidAuthorization). They reply with `signatureCipher` formats that
+// must be deciphered, and the media URL only serves ranges past the first MiB
+// when a GVS PO token bound to the *video id* is appended as `pot`.
+//
+// VISIONOS is a device client used only as a fallback: some videos (long HDR
+// test clips, for instance) are rejected by the web clients but served to this
+// one. It still sends the account cookies, but YouTube refuses SAPISIDHASH for
+// device clients (`sendAuth: false`), and its direct googlevideo URLs already
+// work past the first MiB without a PO token (`needsPoToken: false`).
 export const PLAYER_CLIENTS = {
   mweb: {
     name: 'MWEB',
@@ -127,12 +133,34 @@ export const PLAYER_CLIENTS = {
       clientVersion: '1.20260708.06.00'
     },
     sendCookies: true
+  },
+  // Device fallback. Keep it last: it is only queried when both signed-in web
+  // clients fail, so the normal path pays nothing for it.
+  visionos: {
+    name: 'VISIONOS',
+    clientId: '101',
+    version: '1.02',
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+    context: {
+      clientName: 'VISIONOS',
+      clientVersion: '1.02',
+      deviceMake: 'Apple',
+      deviceModel: 'RealityDevice17,1',
+      osName: 'visionOS',
+      osVersion: '26.5.23O471'
+    },
+    sendCookies: true,
+    sendAuth: false,
+    needsPoToken: false
   }
 };
 
 // Order matters: MWEB answers for most videos and is preferred, WEB_CREATOR is
 // the fallback for the ones MWEB cannot serve.
 export const LOGGED_IN_CLIENTS = ['mweb', 'web_creator'];
+
+// Device clients used only after every signed-in client failed.
+export const DEVICE_FALLBACK_CLIENTS = ['visionos'];
 
 export function extractVisitorData(html) {
   const match = /"VISITOR_DATA"\s*:\s*"([^"]+)"/.exec(String(html || ''));

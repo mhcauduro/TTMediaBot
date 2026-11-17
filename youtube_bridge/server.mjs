@@ -8,6 +8,7 @@ import { URL } from 'node:url';
 import { ClientType, Innertube, UniversalCache, Platform } from 'youtubei.js';
 import { ExpiringLruCache } from './cache.mjs';
 import {
+  DEVICE_FALLBACK_CLIENTS,
   LOGGED_IN_CLIENTS,
   PLAYER_CLIENTS,
   appendPoToken,
@@ -40,7 +41,10 @@ const PLAYER_REQUEST_TIMEOUT_MS = Number(process.env.YOUTUBE_BRIDGE_PLAYER_TIMEO
 // challenge it fetches from YouTube is inconsistent). A rejected token is
 // detected by the range validation, so mint a fresh one and retry. With the
 // observed hit rate, eight attempts fail less than 1% of the time.
-const LOGGED_IN_TOKEN_ATTEMPTS = Number(process.env.YOUTUBE_BRIDGE_TOKEN_ATTEMPTS || 8);
+const LOGGED_IN_TOKEN_ATTEMPTS = Number(process.env.YOUTUBE_BRIDGE_TOKEN_ATTEMPTS || 6);
+// After this many signed-in rounds, also try the device client instead of
+// burning every remaining token attempt on a video the web clients reject.
+const DEVICE_FALLBACK_AFTER_ROUND = 3;
 
 // YouTube.js 18 requires an evaluator to decipher player signatures/nsig.
 Platform.shim.eval = async (data) => new Function(data.output)();
@@ -476,12 +480,15 @@ async function getPlayerSessionData(cookieFile, videoId, { forceFresh = false } 
 
 async function requestPlayerJson(videoId, client, sessionData) {
   // Every remaining client is a logged-in one and carries the account session.
+  // Device clients (`sendAuth: false`) take the cookies but reject SAPISIDHASH.
   const auth = client.sendCookies
     ? {
       cookie: sessionData?.cookieHeader || '',
-      authorization: buildSapisidAuthorization(sessionData?.cookieHeader, sessionData?.userSessionId),
-      sessionIndex: sessionData?.sessionIndex ?? 0,
-      loggedIn: Boolean(sessionData?.loggedIn)
+      ...(client.sendAuth === false ? {} : {
+        authorization: buildSapisidAuthorization(sessionData?.cookieHeader, sessionData?.userSessionId),
+        sessionIndex: sessionData?.sessionIndex ?? 0,
+        loggedIn: Boolean(sessionData?.loggedIn)
+      })
     }
     : {};
   const response = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
@@ -509,12 +516,12 @@ function withPlayerDecipher(task) {
 
 // Logged-in resolution path.
 //
-// Every request is made as the bot account: the watch page is loaded with the
-// bot cookies, the player requests carry the cookie jar plus the SAPISIDHASH
-// authorization derived from it (cookies alone still answer LOGIN_REQUIRED),
-// and the media URL only plays past the first MiB when a GVS PO token bound to
-// the video id is appended as `pot`. There is deliberately no anonymous
-// fallback: availability and quality must be the account's.
+// Every request is made with the bot account: the watch page is loaded with the
+// bot cookies, and the primary player requests carry the cookie jar plus the
+// SAPISIDHASH authorization derived from it (cookies alone still answer
+// LOGIN_REQUIRED). Their media URLs only play past the first MiB when a GVS PO
+// token bound to the video id is appended as `pot`. There is no anonymous
+// client: even the device fallback sends the account cookies.
 //
 // Latency work:
 //  * the first PO token is minted while the player requests are in flight (the
@@ -522,7 +529,8 @@ function withPlayerDecipher(task) {
 //  * another token is always minted in the background, so a rejected token does
 //    not wait for a fresh BotGuard round trip;
 //  * both signed-in clients are queried at once and validated in parallel;
-//  * the per-range validation probes run concurrently.
+//  * the per-range validation probes run concurrently;
+//  * the device fallback is only queried after the signed-in clients fail.
 async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = '', forceFresh = false } = {}) {
   if (!cookieFile) throw new Error('no YouTube cookie file for this bot');
   const startedAt = performance.now();
@@ -554,8 +562,8 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
   };
   refillTokens();
 
-  const fetchCandidates = async () => {
-    const players = await Promise.all(LOGGED_IN_CLIENTS.map(async (clientKey) => {
+  const fetchCandidates = async (clientKeys) => {
+    const players = await Promise.all(clientKeys.map(async (clientKey) => {
       const client = PLAYER_CLIENTS[clientKey];
       const playerStartedAt = performance.now();
       try {
@@ -605,22 +613,79 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
     return found;
   };
 
-  let candidates = await fetchCandidates();
+  let candidates = await fetchCandidates(LOGGED_IN_CLIENTS);
   if (!candidates.length && /LOGIN_REQUIRED|UNPLAYABLE/i.test(failures.join(' '))) {
     // A cached visitor/session can go stale; one refresh fixes it.
     sessionData = await getPlayerSessionData(cookieFile, videoId, { forceFresh: true });
-    candidates = await fetchCandidates();
+    candidates = await fetchCandidates(LOGGED_IN_CLIENTS);
   }
-  if (!candidates.length) throw new Error(failures.join(' | '));
 
-  const isLive = candidates.some(({ playerJson }) => (
+  const isLiveFor = (list) => list.some(({ playerJson }) => (
     playerJson?.videoDetails?.isLive || playerJson?.videoDetails?.isLiveContent
   ));
 
-  for (let round = 1; round <= LOGGED_IN_TOKEN_ATTEMPTS; round++) {
+  // Device fallback: the web clients above cannot serve every video (long HDR
+  // test clips are the usual case). A device client still carries the account
+  // cookies, returns direct googlevideo URLs and needs no PO token. It runs
+  // after a few signed-in rounds (and at the end if those never got there), so a
+  // normal video never pays for it.
+  let deviceAttempted = false;
+  async function tryDeviceFallback() {
+    deviceAttempted = true;
+    let deviceCandidates = await fetchCandidates(DEVICE_FALLBACK_CLIENTS);
+    for (let attempt = 1; attempt <= 2 && deviceCandidates.length; attempt++) {
+      const results = await Promise.all(deviceCandidates.map(async (candidate) => {
+        try {
+          const streamUrl = candidate.client.needsPoToken === false
+            ? candidate.baseUrl
+            : appendPoToken(candidate.baseUrl, await takeToken());
+          const validatedLength = await validateStreamUrl(
+            streamUrl,
+            { 'User-Agent': candidate.client.userAgent },
+            candidate.format.content_length,
+            { isLive: isLiveFor(deviceCandidates) }
+          );
+          return { candidate, streamUrl, validatedLength };
+        } catch (error) {
+          return { candidate, error };
+        }
+      }));
+
+      const winner = results.find((result) => !result.error);
+      if (winner) {
+        const { candidate } = winner;
+        if (winner.validatedLength) candidate.format.content_length = winner.validatedLength;
+        candidate.format.url = winner.streamUrl;
+        console.log(`[youtube-bridge] resolved ${videoId} with client=${candidate.client.name} mode=device-fallback itag=${candidate.format.itag} attempt=${attempt} elapsed_ms=${Math.round(performance.now() - startedAt)}`);
+        return {
+          info: playerInfo(candidate.playerJson, videoId),
+          format: candidate.format,
+          client: candidate.client.name,
+          userAgent: candidate.client.userAgent
+        };
+      }
+
+      for (const { candidate, error } of results) {
+        const message = error?.message || String(error);
+        failures.push(`device:${candidate.client.name}#${attempt}: ${message}`);
+        console.warn(`[youtube-bridge] ${videoId} client=${candidate.client.name} mode=device-fallback attempt=${attempt} failed: ${message}`);
+      }
+
+      // A fresh player response may land on a different googlevideo host.
+      deviceCandidates = await fetchCandidates(DEVICE_FALLBACK_CLIENTS);
+    }
+    return null;
+  }
+
+  for (let round = 1; round <= LOGGED_IN_TOKEN_ATTEMPTS && candidates.length; round++) {
     const roundStartedAt = performance.now();
     const poToken = await takeToken();
-    if (!poToken) throw new Error(`POT provider returned no token; ${failures.join(' | ')}`);
+    // No token means the provider is unavailable, but the device fallback below
+    // does not need one, so keep going instead of failing here.
+    if (!poToken) {
+      failures.push('POT provider returned no token');
+      break;
+    }
 
     const results = await Promise.all(candidates.map(async (candidate) => {
       try {
@@ -629,7 +694,7 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
           streamUrl,
           { 'User-Agent': candidate.client.userAgent },
           candidate.format.content_length,
-          { isLive }
+          { isLive: isLiveFor(candidates) }
         );
         return { candidate, streamUrl, validatedLength };
       } catch (error) {
@@ -663,6 +728,15 @@ async function resolveWithLoggedInPlayer(videoId, formatOptions, { cookieFile = 
     // often enough that two in a row are common. The rounds below mint a fresh
     // token each time, so a client that truly cannot serve the video simply
     // keeps failing while a working one wins the round.
+    if (round >= DEVICE_FALLBACK_AFTER_ROUND && !deviceAttempted) {
+      const fallback = await tryDeviceFallback();
+      if (fallback) return fallback;
+    }
+  }
+
+  if (!deviceAttempted) {
+    const fallback = await tryDeviceFallback();
+    if (fallback) return fallback;
   }
 
   throw new Error(failures.join(' | '));
