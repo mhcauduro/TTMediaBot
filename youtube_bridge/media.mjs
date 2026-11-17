@@ -94,40 +94,14 @@ export function validationProbeRanges(contentLength, chunkSize, probeBytes) {
   ];
 }
 
-// Player clients whose response contains direct googlevideo URLs WITHOUT the
-// `n`/`pot` query parameters. Those parameters are exactly what makes YouTube
-// answer 403 for every range past the first MiB, so the bridge resolves streams
-// with this client instead of the web/MWEB ones. The values mirror what yt-dlp
-// uses: a clean client-only context plus the visitor data taken from a real
-// `/watch` page load (`X-Goog-Visitor-Id`). A homepage visitor is not accepted
-// since 2026-11-16 and yields `LOGIN_REQUIRED: Sign in to confirm you're not a bot`.
+// Player clients used for signed-in playback. Every client here is called with
+// the bot cookies plus the SAPISIDHASH authorization headers (see
+// buildSapisidAuthorization); there is no anonymous client left on purpose.
 //
-// VISIONOS is the only tested client that survives the full range probe. Others
-// that also answer without `n` (ANDROID_VR, TV_SAMSUNG) still return 403 past
-// ~1 MiB from this host, or only expose SABR/URL-less formats, so they are
-// intentionally not used.
+// MWEB replies with `signatureCipher` formats that must be deciphered, and the
+// media URL only serves ranges past the first MiB when a GVS PO token bound to
+// the *video id* is appended as `pot`.
 export const PLAYER_CLIENTS = {
-  visionos: {
-    name: 'VISIONOS',
-    clientId: '101',
-    version: '1.02',
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
-    context: {
-      clientName: 'VISIONOS',
-      clientVersion: '1.02',
-      deviceMake: 'Apple',
-      deviceModel: 'RealityDevice17,1',
-      osName: 'visionOS',
-      osVersion: '26.5.23O471'
-    }
-  },
-  // Logged-in client. Since 2026-11-16 YouTube only answers the player API
-  // with playable formats when the request carries the account session:
-  // cookies alone still yield `LOGIN_REQUIRED`, so the bridge also sends the
-  // SAPISIDHASH authorization headers (see buildSapisidAuthorization). MWEB
-  // replies with `signatureCipher` formats that must be deciphered, and the
-  // media URL only serves ranges past the first MiB when a GVS PO token bound
-  // to the *video id* is appended as `pot`.
   mweb: {
     name: 'MWEB',
     clientId: '2',

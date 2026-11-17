@@ -143,11 +143,11 @@ test('extracts the player signature timestamp from the watch page', () => {
 });
 
 test('builds a clean player request like yt-dlp does', () => {
-  const client = PLAYER_CLIENTS.visionos;
+  const client = PLAYER_CLIENTS.mweb;
   const body = playerRequestBody('8f6sRJ2BRtk', client);
   assert.equal(body.videoId, '8f6sRJ2BRtk');
-  assert.equal(body.context.client.clientName, 'VISIONOS');
-  assert.equal(body.context.client.clientVersion, '1.02');
+  assert.equal(body.context.client.clientName, 'MWEB');
+  assert.equal(body.context.client.clientVersion, '2.20260708.05.00');
   assert.equal(body.context.client.hl, 'en');
   assert.equal(body.context.client.timeZone, 'UTC');
   assert.equal(body.context.client.utcOffsetMinutes, 0);
@@ -161,8 +161,8 @@ test('builds a clean player request like yt-dlp does', () => {
   assert.equal(withSts.playbackContext.contentPlaybackContext.signatureTimestamp, 20767);
 
   const headers = playerRequestHeaders(client, 'VISITOR123');
-  assert.equal(headers['x-youtube-client-name'], '101');
-  assert.equal(headers['x-youtube-client-version'], '1.02');
+  assert.equal(headers['x-youtube-client-name'], '2');
+  assert.equal(headers['x-youtube-client-version'], '2.20260708.05.00');
   assert.equal(headers['x-goog-visitor-id'], 'VISITOR123');
   assert.equal(headers.origin, 'https://www.youtube.com');
   assert.equal(headers['user-agent'], client.userAgent);
@@ -382,6 +382,7 @@ test('tries MWEB first and falls back to WEB_CREATOR for logged-in playback', ()
     assert.equal(PLAYER_CLIENTS[key].context.clientName, PLAYER_CLIENTS[key].name);
     assert.ok(PLAYER_CLIENTS[key].userAgent);
   }
-  // The anonymous VISIONOS client must never receive the account session.
-  assert.equal(PLAYER_CLIENTS.visionos.sendCookies, undefined);
+  // There is no anonymous client left: only logged-in clients are allowed.
+  assert.equal(PLAYER_CLIENTS.visionos, undefined);
+  assert.deepEqual(Object.keys(PLAYER_CLIENTS).sort(), ['mweb', 'web_creator']);
 });
